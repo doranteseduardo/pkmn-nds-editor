@@ -1,5 +1,7 @@
 # Pokémon DPPt Map Editor
 
+![Screenshot](screenshot.png)
+
 A web-based map editor for **Pokémon Diamond**, **Pearl**, and **Platinum** (Nintendo DS), built with **React + TypeScript + Tauri**.
 
 ## Features
@@ -72,22 +74,22 @@ src-tauri/
 
 ## Keyboard Shortcuts
 
-| Key | Action |
-|-----|--------|
-| `P` | Paint tool |
-| `F` | Fill tool |
-| `I` | Pick (eyedropper) tool |
-| `E` | Event selection tool |
-| `Alt+Drag` | Pan the view |
-| `Scroll` | Zoom in/out |
-| `Ctrl/Cmd+S` | Save ROM |
+| Key          | Action                 |
+| ------------ | ---------------------- |
+| `P`          | Paint tool             |
+| `F`          | Fill tool              |
+| `I`          | Pick (eyedropper) tool |
+| `E`          | Event selection tool   |
+| `Alt+Drag`   | Pan the view           |
+| `Scroll`     | Zoom in/out            |
+| `Ctrl/Cmd+S` | Save ROM               |
 
 ## Supported Games
 
-| Game | Region | Code |
-|------|--------|------|
-| Diamond | US/EU/JP/KR | ADAE/ADAP/ADAJ/ADAK |
-| Pearl | US/EU/JP/KR | APAE/APAP/APAJ/APAK |
+| Game     | Region      | Code                |
+| -------- | ----------- | ------------------- |
+| Diamond  | US/EU/JP/KR | ADAE/ADAP/ADAJ/ADAK |
+| Pearl    | US/EU/JP/KR | APAE/APAP/APAJ/APAK |
 | Platinum | US/EU/JP/KR | CPUE/CPUP/CPUJ/CPUK |
 
 ## Technical Notes
