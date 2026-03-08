@@ -1,0 +1,27 @@
+{
+  "$schema": "https://raw.githubusercontent.com/nicecatch/tauri-schema/main/schemas/v2.json",
+  "productName": "Pokemon DPPt Map Editor",
+  "version": "0.1.0",
+  "identifier": "com.pokemon-dpt-map-editor.app",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:1420",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Pokemon DPPt Map Editor",
+        "width": 1400,
+        "height": 900,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "plugins": {}
+}
