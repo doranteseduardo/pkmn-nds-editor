@@ -2,7 +2,7 @@ import { useState } from "react";
 import type { MapData } from "../lib/map-data";
 import type { EventData, EventType } from "../lib/events";
 import type { EncounterData } from "../lib/encounters";
-import { PERM_TYPES } from "../lib/map-data";
+import { PERM_TYPES, getBuildingWorldPos, rotU16ToDeg } from "../lib/map-data";
 import { GRASS_RATES } from "../lib/encounters";
 
 interface Props {
@@ -89,13 +89,16 @@ function PermPanel({ selectedPerm, onPermSelect, mapData }: Props) {
         </div>
         <div style={{ fontSize: "10px", color: "var(--text-dim)", marginTop: "4px" }}>
           Press Enter to set. Current: 0x{selectedPerm.toString(16).toUpperCase().padStart(4, "0")}
+          <br />
+          Type: 0x{(selectedPerm & 0xFF).toString(16).toUpperCase().padStart(2, "0")}
+          {" | "}Col: 0x{((selectedPerm >> 8) & 0xFF).toString(16).toUpperCase().padStart(2, "0")}
         </div>
       </div>
       {mapData && (
         <div className="prop-group">
           <div className="prop-group-title">Map Stats</div>
           <div style={{ fontSize: "11px", color: "var(--text-dim)" }}>
-            <div>Size: {mapData.permissions.width}×{mapData.permissions.height}</div>
+            <div>Size: {mapData.permissions.width}x{mapData.permissions.height}</div>
             <div>Perm data: {mapData.permissionSize} bytes</div>
             <div>Building data: {mapData.buildingSize} bytes</div>
             <div>Model data: {mapData.modelSize} bytes</div>
@@ -111,13 +114,18 @@ function PermPanel({ selectedPerm, onPermSelect, mapData }: Props) {
 // ─── Event Panel ──────────────────────────────────────────────
 
 const EVENT_SECTIONS: { key: EventType; label: string; color: string; icon: string }[] = [
+  { key: "spawnables", label: "Spawnables / Signs", color: "var(--sign-color)", icon: "S" },
   { key: "overworlds", label: "NPCs / Overworlds", color: "var(--npc-color)", icon: "N" },
   { key: "warps", label: "Warps", color: "var(--warp-color)", icon: "W" },
   { key: "triggers", label: "Triggers", color: "var(--trigger-color)", icon: "T" },
-  { key: "signs", label: "Signs", color: "var(--sign-color)", icon: "S" },
 ];
 
 const EVENT_FIELDS: Record<EventType, { key: string; label: string }[]> = {
+  spawnables: [
+    { key: "script", label: "Script" }, { key: "type", label: "Type" },
+    { key: "direction", label: "Direction" },
+    { key: "x", label: "X" }, { key: "y", label: "Y" }, { key: "z", label: "Z" },
+  ],
   overworlds: [
     { key: "id", label: "ID" }, { key: "spriteId", label: "Sprite" },
     { key: "movementType", label: "Movement" }, { key: "type", label: "Type" },
@@ -129,7 +137,7 @@ const EVENT_FIELDS: Record<EventType, { key: string; label: string }[]> = {
   warps: [
     { key: "x", label: "X" }, { key: "y", label: "Y" },
     { key: "targetHeader", label: "Target Map" }, { key: "targetWarp", label: "Target Warp" },
-    { key: "contactDir", label: "Direction" }, { key: "transType", label: "Transition" },
+    { key: "height", label: "Height" },
   ],
   triggers: [
     { key: "script", label: "Script" },
@@ -137,10 +145,6 @@ const EVENT_FIELDS: Record<EventType, { key: string; label: string }[]> = {
     { key: "width", label: "Width" }, { key: "height", label: "Height" },
     { key: "z", label: "Z" },
     { key: "valueCheck", label: "Value" }, { key: "variable", label: "Variable" },
-  ],
-  signs: [
-    { key: "script", label: "Script" }, { key: "type", label: "Type" },
-    { key: "x", label: "X" }, { key: "y", label: "Y" }, { key: "z", label: "Z" },
   ],
 };
 
@@ -157,10 +161,10 @@ function EventPanel({ eventData, selectedEvent, onSelectEvent, onEventUpdate, on
           {(eventData[sec.key] as any[]).map((ev: Record<string, number>, i: number) => {
             const isSelected = selectedEvent?.type === sec.key && selectedEvent?.index === i;
             const summary =
+              sec.key === "spawnables" ? `Spawnable (Script ${ev.script}, Type ${ev.type})` :
               sec.key === "overworlds" ? `NPC #${ev.id} (Sprite ${ev.spriteId})` :
-              sec.key === "warps" ? `Warp → Map ${ev.targetHeader}` :
-              sec.key === "triggers" ? `Script ${ev.script}` :
-              `Sign (Script ${ev.script})`;
+              sec.key === "warps" ? `Warp -> Map ${ev.targetHeader}` :
+              `Trigger (Script ${ev.script})`;
             return (
               <div key={i}>
                 <div
@@ -192,7 +196,7 @@ function EventPanel({ eventData, selectedEvent, onSelectEvent, onEventUpdate, on
                       style={{ marginTop: 6, width: "100%" }}
                       onClick={() => onDeleteEvent(sec.key, i)}
                     >
-                      🗑 Delete
+                      Delete
                     </button>
                   </div>
                 )}
@@ -217,13 +221,13 @@ function EncounterPanel({ data }: { data: EncounterData | null }) {
     <div>
       {data.walkRate > 0 && (
         <div className="encounter-section">
-          <div className="encounter-section-title">🌿 Grass (Rate: {data.walkRate})</div>
+          <div className="encounter-section-title">Grass (Rate: {data.walkRate})</div>
           {data.grassSlots.map((slot, i) => (
             <div key={i} className="encounter-slot">
               <div className="slot-rate">{GRASS_RATES[i]}%</div>
               <div style={{ flex: 1, fontSize: 12 }}>Species #{slot.species}</div>
               <div style={{ fontSize: 10, color: "var(--text-dim)", fontFamily: "monospace" }}>
-                Lv.{slot.minLevel}–{slot.maxLevel}
+                Lv.{slot.minLevel}-{slot.maxLevel}
               </div>
             </div>
           ))}
@@ -231,13 +235,13 @@ function EncounterPanel({ data }: { data: EncounterData | null }) {
       )}
       {data.surfRate > 0 && data.waterSlots.length > 0 && (
         <div className="encounter-section">
-          <div className="encounter-section-title">🌊 Surf (Rate: {data.surfRate})</div>
+          <div className="encounter-section-title">Surf (Rate: {data.surfRate})</div>
           {data.waterSlots.map((slot, i) => (
             <div key={i} className="encounter-slot">
               <div className="slot-rate">#{i}</div>
               <div style={{ flex: 1, fontSize: 12 }}>Species #{slot.species}</div>
               <div style={{ fontSize: 10, color: "var(--text-dim)", fontFamily: "monospace" }}>
-                Lv.{slot.minLevel}–{slot.maxLevel}
+                Lv.{slot.minLevel}-{slot.maxLevel}
               </div>
             </div>
           ))}
@@ -245,7 +249,7 @@ function EncounterPanel({ data }: { data: EncounterData | null }) {
       )}
       {data.swarmSpecies?.[0] > 0 && (
         <div className="encounter-section">
-          <div className="encounter-section-title">🌸 Special Encounters</div>
+          <div className="encounter-section-title">Special Encounters</div>
           <div style={{ fontSize: 11, color: "var(--text-dim)" }}>
             <div>Swarm: #{data.swarmSpecies.filter(s => s > 0).join(", #")}</div>
             <div>Day: #{data.daySpecies.filter(s => s > 0).join(", #")}</div>
@@ -272,7 +276,7 @@ function InfoPanel({ mapData, eventData, currentMapIdx }: Props) {
           </div>
           {mapData && (
             <>
-              <div className="prop-row"><span className="prop-label">Grid Size</span><span>{mapData.permissions.width} × {mapData.permissions.height}</span></div>
+              <div className="prop-row"><span className="prop-label">Grid Size</span><span>{mapData.permissions.width} x {mapData.permissions.height}</span></div>
               <div className="prop-row"><span className="prop-label">Perm Size</span><span style={{ fontFamily: "monospace" }}>{mapData.permissionSize} bytes</span></div>
               <div className="prop-row"><span className="prop-label">Model Size</span><span style={{ fontFamily: "monospace" }}>{mapData.modelSize} bytes</span></div>
               <div className="prop-row"><span className="prop-label">Buildings</span><span>{mapData.buildings.length}</span></div>
@@ -280,10 +284,10 @@ function InfoPanel({ mapData, eventData, currentMapIdx }: Props) {
           )}
           {eventData && (
             <>
+              <div className="prop-row"><span className="prop-label">Spawnables</span><span>{eventData.spawnables.length}</span></div>
               <div className="prop-row"><span className="prop-label">NPCs</span><span>{eventData.overworlds.length}</span></div>
               <div className="prop-row"><span className="prop-label">Warps</span><span>{eventData.warps.length}</span></div>
               <div className="prop-row"><span className="prop-label">Triggers</span><span>{eventData.triggers.length}</span></div>
-              <div className="prop-row"><span className="prop-label">Signs</span><span>{eventData.signs.length}</span></div>
             </>
           )}
         </div>
@@ -305,14 +309,22 @@ function InfoPanel({ mapData, eventData, currentMapIdx }: Props) {
         <div className="prop-group">
           <div className="prop-group-title">Building List</div>
           <div style={{ fontSize: 11 }}>
-            {mapData.buildings.map((b, i) => (
-              <div key={i} style={{ padding: "3px 0", borderBottom: "1px solid var(--border)" }}>
-                <span style={{ color: "var(--accent3)" }}>#{i}</span> Model {b.modelId}
-                <span style={{ color: "var(--text-dim)", marginLeft: 8 }}>
-                  ({(b.x / 16).toFixed(1)}, {(b.y / 16).toFixed(1)}, {(b.z / 16).toFixed(1)})
-                </span>
-              </div>
-            ))}
+            {mapData.buildings.map((b, i) => {
+              const pos = getBuildingWorldPos(b);
+              return (
+                <div key={i} style={{ padding: "3px 0", borderBottom: "1px solid var(--border)" }}>
+                  <span style={{ color: "var(--accent3)" }}>#{i}</span> Model {b.modelId}
+                  <span style={{ color: "var(--text-dim)", marginLeft: 8 }}>
+                    ({pos.x.toFixed(1)}, {pos.y.toFixed(1)}, {pos.z.toFixed(1)})
+                  </span>
+                  {b.yRotation !== 0 && (
+                    <span style={{ color: "var(--text-dim)", marginLeft: 4 }}>
+                      rot:{rotU16ToDeg(b.yRotation).toFixed(0)}
+                    </span>
+                  )}
+                </div>
+              );
+            })}
           </div>
         </div>
       )}

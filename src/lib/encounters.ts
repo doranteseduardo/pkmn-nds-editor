@@ -1,9 +1,9 @@
 /**
- * DPPt encounter data parser.
+ * DPPt encounter data parser and serializer.
  * Handles grass, surf, and special encounter slots.
  */
 
-import { BinaryReader } from "./binary";
+import { BinaryReader, BinaryWriter } from "./binary";
 
 // ─── Types ───────────────────────────────────────────────────
 
@@ -20,6 +20,8 @@ export interface EncounterData {
   daySpecies: number[];
   nightSpecies: number[];
   radarSpecies: number[];
+  /** Padding/form data between radar and surf */
+  _formData: number[];
   surfRate: number;
   waterSlots: EncounterSlot[];
 }
@@ -56,8 +58,11 @@ export function parseEncounterData(buffer: ArrayBuffer): EncounterData | null {
   // Water encounters
   let waterSlots: EncounterSlot[] = [];
   let surfRate = 0;
+  const _formData: number[] = [];
+
   if (r.remaining() >= 44) {
-    r.skip(8); // padding / form data
+    // 2 u32 values (padding/form data) before surf rate
+    _formData.push(r.u32(), r.u32());
     surfRate = r.u32();
     for (let i = 0; i < 5; i++) {
       waterSlots.push({
@@ -75,7 +80,49 @@ export function parseEncounterData(buffer: ArrayBuffer): EncounterData | null {
     daySpecies,
     nightSpecies,
     radarSpecies,
+    _formData,
     surfRate,
     waterSlots,
   };
+}
+
+// ─── Serializer ──────────────────────────────────────────────
+
+export function serializeEncounterData(data: EncounterData): ArrayBuffer {
+  // Base size: walkRate(4) + 12 grass slots(12*12=144) + special(10*4=40) = 188
+  // + optional form data(8) + surfRate(4) + 5 water slots(5*12=60) = 72
+  const hasWater = data.surfRate > 0 || data.waterSlots.length > 0;
+  const size = 188 + (hasWater ? 72 : 0);
+  const w = new BinaryWriter(size);
+
+  w.writeU32(data.walkRate);
+
+  // 12 grass slots
+  for (let i = 0; i < 12; i++) {
+    const slot = data.grassSlots[i] ?? { maxLevel: 0, minLevel: 0, species: 0 };
+    w.writeU32(slot.maxLevel);
+    w.writeU32(slot.minLevel);
+    w.writeU32(slot.species);
+  }
+
+  // Special species
+  for (let i = 0; i < 2; i++) w.writeU32(data.swarmSpecies[i] ?? 0);
+  for (let i = 0; i < 2; i++) w.writeU32(data.daySpecies[i] ?? 0);
+  for (let i = 0; i < 2; i++) w.writeU32(data.nightSpecies[i] ?? 0);
+  for (let i = 0; i < 4; i++) w.writeU32(data.radarSpecies[i] ?? 0);
+
+  // Water section
+  if (hasWater) {
+    w.writeU32(data._formData[0] ?? 0);
+    w.writeU32(data._formData[1] ?? 0);
+    w.writeU32(data.surfRate);
+    for (let i = 0; i < 5; i++) {
+      const slot = data.waterSlots[i] ?? { maxLevel: 0, minLevel: 0, species: 0 };
+      w.writeU32(slot.maxLevel);
+      w.writeU32(slot.minLevel);
+      w.writeU32(slot.species);
+    }
+  }
+
+  return w.buffer;
 }

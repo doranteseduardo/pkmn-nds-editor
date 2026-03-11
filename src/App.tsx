@@ -10,7 +10,7 @@ import {
 } from "./lib/map-data";
 import {
   parseEventData, serializeEventData,
-  createDefaultOverworld, createDefaultWarp, createDefaultTrigger, createDefaultSign,
+  createDefaultSpawnable, createDefaultOverworld, createDefaultWarp, createDefaultTrigger,
   type EventData, type EventType,
 } from "./lib/events";
 import { parseEncounterData, type EncounterData } from "./lib/encounters";
@@ -80,20 +80,19 @@ export default function App() {
   // ─── Load ROM ──────────────────────────────────
   const loadRom = useCallback(async () => {
     setLoading(true);
-    setLoadingMsg("Opening file…");
+    setLoadingMsg("Opening file...");
     try {
       const result = await openRomFile();
       if (!result) { setLoading(false); return; }
 
-      setLoadingMsg("Parsing NDS header…");
+      setLoadingMsg("Parsing NDS header...");
       const parsed = parseNDSRom(result.buffer);
       setRom(parsed);
       setRomPath(result.path);
       addToast(`Loaded ${parsed.gameInfo.name} (${parsed.gameInfo.region})`, "success");
 
-      // Extract NARCs
       const paths = getGamePaths(parsed.gameInfo.version);
-      setLoadingMsg("Extracting map data…");
+      setLoadingMsg("Extracting map data...");
 
       const tryExtractNarc = (path: string): NARC | null => {
         const alts = [path, path.replace("_release", ""), path.replace(".narc", "_release.narc")];
@@ -123,7 +122,6 @@ export default function App() {
       if (land) addToast(`Found ${land.fileCount} maps`, "success");
       if (matrix?.files[0]) setMatrixData(parseMapMatrix(matrix.files[0].data));
 
-      // Auto-load first map
       if (land && land.fileCount > 0) {
         loadMapInternal(0, land, events, encounters);
       }
@@ -143,16 +141,10 @@ export default function App() {
         : parseMapData(ln.files[idx].data);
       setMapData(md);
 
-      // Parse BDHC from the map's raw buffer
-      if (md && md.rawBuffer) {
-        const bdhcOffset = 16 + md.permissionSize + md.buildingSize + md.modelSize;
-        if (md.bdhcSize > 8 && bdhcOffset + md.bdhcSize <= md.rawBuffer.byteLength) {
-          const bdhcBuf = md.rawBuffer.slice(bdhcOffset, bdhcOffset + md.bdhcSize);
-          const bdhc = parseBDHC(bdhcBuf);
-          setBdhcData(bdhc);
-        } else {
-          setBdhcData(null);
-        }
+      // Parse BDHC from the map data's extracted bdhcData
+      if (md?.bdhcData && md.bdhcData.byteLength > 8) {
+        const bdhc = parseBDHC(md.bdhcData);
+        setBdhcData(bdhc);
       } else {
         setBdhcData(null);
       }
@@ -160,7 +152,7 @@ export default function App() {
       if (en && idx < en.fileCount) {
         setEventData(modifiedEvents[idx] ?? parseEventData(en.files[idx].data));
       } else {
-        setEventData({ overworlds: [], warps: [], triggers: [], signs: [] });
+        setEventData({ spawnables: [], overworlds: [], warps: [], triggers: [] });
       }
 
       if (ec && idx < ec.fileCount) {
@@ -212,10 +204,10 @@ export default function App() {
     if (!eventData || currentMapIdx === null) return;
     const newEvents = { ...eventData };
     const templates: Record<EventType, unknown> = {
+      spawnables: createDefaultSpawnable(),
       overworlds: createDefaultOverworld(newEvents.overworlds.length),
       warps: createDefaultWarp(),
       triggers: createDefaultTrigger(),
-      signs: createDefaultSign(),
     };
     (newEvents[type] as unknown[]) = [...newEvents[type], templates[type]];
     setEventData(newEvents as EventData);
@@ -242,7 +234,6 @@ export default function App() {
       const newRom = rom.buffer.slice(0);
       const paths = getGamePaths(rom.gameInfo.version);
 
-      // Patch map data
       if (Object.keys(modifiedMaps).length > 0) {
         const narcFiles = landNarc.files.map((f, i) => modifiedMaps[i] ?? f.data);
         const newNarc = rebuildNARC(narcFiles);
@@ -253,7 +244,6 @@ export default function App() {
         }
       }
 
-      // Patch event data
       if (Object.keys(modifiedEvents).length > 0) {
         const narcFiles = eventNarc.files.map((f, i) =>
           modifiedEvents[i] ? serializeEventData(modifiedEvents[i]) : f.data
@@ -301,14 +291,12 @@ export default function App() {
 
   return (
     <div className="app">
-      {/* Toast container */}
       <div className="toast-container">
         {toasts.map(t => (
           <div key={t.id} className={`toast toast-${t.type}`}>{t.msg}</div>
         ))}
       </div>
 
-      {/* Loading overlay */}
       {loading && (
         <div className="loading-overlay">
           <div className="loading-box">
@@ -318,46 +306,42 @@ export default function App() {
         </div>
       )}
 
-      {/* File tree modal */}
       {showFileTree && rom && (
         <FileTreeModal tree={rom.fileTree} onClose={() => setShowFileTree(false)} />
       )}
 
-      {/* Header */}
       <div className="header">
-        <h1><span>◆</span> Pokémon DPPt Map Editor</h1>
+        <h1><span>&#9670;</span> Pokemon DPPt Map Editor</h1>
         <div className="header-info">
           {rom ? (
             <>
               <span className={badgeClass}>{rom.gameInfo.name} ({rom.gameInfo.region})</span>
               <span>{rom.title}</span>
               <span>{(rom.romSize / 1024 / 1024).toFixed(1)} MB</span>
-              {hasUnsavedChanges && <span style={{ color: "var(--accent)" }}>● Unsaved</span>}
-              <button className="tool-btn" onClick={() => setShowFileTree(true)}>📁 Files</button>
-              <button className="tool-btn" onClick={loadRom}>📂 Open ROM</button>
+              {hasUnsavedChanges && <span style={{ color: "var(--accent)" }}>Unsaved</span>}
+              <button className="tool-btn" onClick={() => setShowFileTree(true)}>Files</button>
+              <button className="tool-btn" onClick={loadRom}>Open ROM</button>
               {hasUnsavedChanges && (
-                <button className="tool-btn" onClick={handleSave} style={{ color: "var(--accent2)" }}>💾 Save ROM</button>
+                <button className="tool-btn" onClick={handleSave} style={{ color: "var(--accent2)" }}>Save ROM</button>
               )}
             </>
           ) : (
-            <button className="tool-btn" onClick={loadRom} style={{ color: "var(--accent2)" }}>📂 Open ROM</button>
+            <button className="tool-btn" onClick={loadRom} style={{ color: "var(--accent2)" }}>Open ROM</button>
           )}
         </div>
       </div>
 
-      {/* Main layout */}
       <div className="main">
         {!rom ? (
-          /* Landing screen */
           <div className="landing">
-            <div className="landing-logo">◆</div>
-            <h2>Pokémon DPPt Map Editor</h2>
+            <div className="landing-logo">&#9670;</div>
+            <h2>Pokemon DPPt Map Editor</h2>
             <p>
-              A map editor for Pokémon Diamond, Pearl, and Platinum.
+              A map editor for Pokemon Diamond, Pearl, and Platinum.
               Load your NDS ROM to begin editing maps, events, permissions, and encounters.
             </p>
             <div className="file-drop" onClick={loadRom}>
-              <div className="drop-icon">💾</div>
+              <div className="drop-icon">&#128190;</div>
               <div className="drop-text">Click to open a .nds ROM file</div>
               <div className="drop-hint">Supports Diamond, Pearl, and Platinum (US/EU/JP)</div>
             </div>
@@ -379,7 +363,6 @@ export default function App() {
               }}
             />
             <div className="content">
-              {/* Toolbar */}
               <div className="toolbar">
                 <div className="tool-group">
                   <button
@@ -389,16 +372,16 @@ export default function App() {
                   <button
                     className={`tool-btn ${viewMode === "3d" ? "active" : ""}`}
                     onClick={() => setViewMode("3d")}
-                    title={bdhcData ? `${bdhcData.plates.length} plates` : "No BDHC data (flat view)"}
-                  >3D{bdhcData ? "" : " ○"}</button>
+                    title={bdhcData ? `${bdhcData.plates.length} plates` : "No BDHC data"}
+                  >3D{mapData?.modelData ? "" : " (flat)"}</button>
                 </div>
                 {viewMode === "2d" && (
                   <div className="tool-group">
                     {[
-                      { id: "paint", label: "✏ Paint" },
-                      { id: "fill", label: "■ Fill" },
-                      { id: "pick", label: "🔍 Pick" },
-                      { id: "event", label: "📍 Events" },
+                      { id: "paint", label: "Paint" },
+                      { id: "fill", label: "Fill" },
+                      { id: "pick", label: "Pick" },
+                      { id: "event", label: "Events" },
                     ].map(t => (
                       <button
                         key={t.id}
@@ -420,12 +403,11 @@ export default function App() {
                 {hasUnsavedChanges && (
                   <div className="tool-group">
                     <button className="tool-btn" onClick={handleSave} style={{ color: "var(--accent2)", fontWeight: 600 }}>
-                      💾 Save ROM
+                      Save ROM
                     </button>
                   </div>
                 )}
               </div>
-              {/* Workspace */}
               <div className="workspace">
                 {viewMode === "2d" ? (
                   <MapCanvas
@@ -445,6 +427,7 @@ export default function App() {
                     permissions={mapData?.permissions ?? null}
                     eventData={eventData}
                     showEvents={showLayers.events}
+                    mapData={mapData}
                   />
                 )}
                 <RightPanel

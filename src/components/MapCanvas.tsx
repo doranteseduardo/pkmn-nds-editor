@@ -74,7 +74,7 @@ export default function MapCanvas({
     if (showLayers.events && eventData) {
       drawTriggers(ctx, eventData, TILE);
       drawWarps(ctx, eventData, TILE);
-      drawSigns(ctx, eventData, TILE);
+      drawSpawnables(ctx, eventData, TILE);
       drawOverworlds(ctx, eventData, TILE);
     }
 
@@ -99,7 +99,6 @@ export default function MapCanvas({
 
   // ─── Mouse handlers ──────────────────────────
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
-    // Pan with middle-click or alt+click
     if (e.button === 1 || (e.button === 0 && e.altKey)) {
       setIsPanning(true);
       panStart.current = { x: e.clientX - pan.x, y: e.clientY - pan.y };
@@ -112,7 +111,6 @@ export default function MapCanvas({
     if (!tile) return;
 
     if (activeTool === "event") {
-      // Try to select an event at this tile
       if (eventData) {
         for (let i = eventData.overworlds.length - 1; i >= 0; i--) {
           if (eventData.overworlds[i].x === tile.x && eventData.overworlds[i].y === tile.y) {
@@ -131,9 +129,9 @@ export default function MapCanvas({
             onSelectEvent({ type: "triggers", index: i }); return;
           }
         }
-        for (let i = eventData.signs.length - 1; i >= 0; i--) {
-          if (eventData.signs[i].x === tile.x && eventData.signs[i].y === tile.y) {
-            onSelectEvent({ type: "signs", index: i }); return;
+        for (let i = eventData.spawnables.length - 1; i >= 0; i--) {
+          if (eventData.spawnables[i].x === tile.x && eventData.spawnables[i].y === tile.y) {
+            onSelectEvent({ type: "spawnables", index: i }); return;
           }
         }
       }
@@ -186,7 +184,6 @@ export default function MapCanvas({
     }
   }, [mapData, onPermChange]);
 
-  // Wheel zoom
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
@@ -288,9 +285,9 @@ function drawTriggers(ctx: CanvasRenderingContext2D, ev: EventData, T: number) {
   }
 }
 
-function drawSigns(ctx: CanvasRenderingContext2D, ev: EventData, T: number) {
-  for (let i = 0; i < ev.signs.length; i++) {
-    const s = ev.signs[i];
+function drawSpawnables(ctx: CanvasRenderingContext2D, ev: EventData, T: number) {
+  for (let i = 0; i < ev.spawnables.length; i++) {
+    const s = ev.spawnables[i];
     const pad = T * 0.15;
     ctx.fillStyle = "rgba(95,39,205,0.5)";
     ctx.strokeStyle = "#5f27cd";

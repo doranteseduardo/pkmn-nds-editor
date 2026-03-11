@@ -1,21 +1,24 @@
 /**
- * 3D heightmap viewer using Three.js.
- * Renders BDHC terrain plates as a 3D mesh with permission-based coloring.
+ * 3D map viewer using Three.js.
+ * Renders NSBMD map terrain models, buildings, BDHC heightmap,
+ * and event markers in a 3D scene with orbit controls.
  */
 
 import { useRef, useEffect, useCallback, useState } from "react";
 import * as THREE from "three";
 import type { BDHC, PlateGeometry } from "../lib/bdhc";
 import { buildHeightmap, PLATE_TYPES } from "../lib/bdhc";
-import type { PermissionGrid } from "../lib/map-data";
-import { getPermColor } from "../lib/map-data";
+import type { PermissionGrid, Building, MapData } from "../lib/map-data";
+import { getPermColor, getBuildingWorldPos, rotU16ToDeg } from "../lib/map-data";
 import type { EventData } from "../lib/events";
+import { parseNSBMD, nsbmdToFlatMesh } from "../lib/nsbmd";
 
 interface Props {
   bdhc: BDHC | null;
   permissions: PermissionGrid | null;
   eventData: EventData | null;
   showEvents: boolean;
+  mapData: MapData | null;
 }
 
 // ─── Plate type colors ──────────────────────────────────────
@@ -32,18 +35,20 @@ const PLATE_COLORS: Record<number, number> = {
 
 // ─── Component ───────────────────────────────────────────────
 
-export default function MapView3D({ bdhc, permissions, eventData, showEvents }: Props) {
+export default function MapView3D({ bdhc, permissions, eventData, showEvents, mapData }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
   const sceneRef = useRef<THREE.Scene | null>(null);
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
   const frameRef = useRef<number>(0);
   const [info, setInfo] = useState("Initializing 3D view…");
+  const [showModel, setShowModel] = useState(true);
+  const [showWireframe, setShowWireframe] = useState(false);
 
   // Camera orbit state
   const orbitRef = useRef({
-    theta: Math.PI / 4,  // horizontal angle
-    phi: Math.PI / 3,    // vertical angle
+    theta: Math.PI / 4,
+    phi: Math.PI / 3,
     radius: 600,
     target: new THREE.Vector3(256, 0, 256),
     isDragging: false,
@@ -102,11 +107,9 @@ export default function MapView3D({ bdhc, permissions, eventData, showEvents }: 
     const grid = new THREE.GridHelper(512, 32, 0x333355, 0x222244);
     scene.add(grid);
 
-    // Axes helper
     const axes = new THREE.AxesHelper(50);
     scene.add(axes);
 
-    // Resize handler
     const onResize = () => {
       const w = container.clientWidth;
       const h = container.clientHeight;
@@ -116,7 +119,6 @@ export default function MapView3D({ bdhc, permissions, eventData, showEvents }: 
     };
     window.addEventListener("resize", onResize);
 
-    // Animation loop
     const animate = () => {
       frameRef.current = requestAnimationFrame(animate);
       updateCamera();
@@ -132,7 +134,6 @@ export default function MapView3D({ bdhc, permissions, eventData, showEvents }: 
     };
   }, []);
 
-  // ─── Update camera from orbit state ───────────
   const updateCamera = useCallback(() => {
     const cam = cameraRef.current;
     if (!cam) return;
@@ -145,16 +146,23 @@ export default function MapView3D({ bdhc, permissions, eventData, showEvents }: 
     cam.lookAt(target);
   }, []);
 
-  // ─── Build 3D scene from BDHC + permissions ───
+  // ─── Build 3D scene ─────────────────────────────
   useEffect(() => {
     const scene = sceneRef.current;
     if (!scene) return;
 
-    // Remove old map meshes (keep lights, grid, axes)
+    // Remove old dynamic meshes
     const toRemove = scene.children.filter(
-      (c) => c.userData.isMapMesh || c.userData.isEventMesh
+      (c) => c.userData.isMapMesh || c.userData.isEventMesh || c.userData.isBuildingMesh
     );
-    toRemove.forEach((c) => scene.remove(c));
+    toRemove.forEach((c) => {
+      if (c instanceof THREE.Mesh) {
+        c.geometry?.dispose();
+        if (Array.isArray(c.material)) c.material.forEach(m => m.dispose());
+        else c.material?.dispose();
+      }
+      scene.remove(c);
+    });
 
     if (!permissions) {
       setInfo("No map data loaded");
@@ -162,27 +170,57 @@ export default function MapView3D({ bdhc, permissions, eventData, showEvents }: 
     }
 
     const { width: gw, height: gh, tiles } = permissions;
-    const TILE = 16; // world units per tile
+    const TILE = 16;
+    let infoStr = "";
 
-    if (bdhc && bdhc.geometry.length > 0) {
-      // ─── Mode A: Render BDHC plates as 3D quads ───
-      const heightmap = buildHeightmap(bdhc, gw, gh, TILE);
-      buildHeightmapMesh(scene, heightmap, tiles, gw, gh, TILE);
-      buildPlateMeshes(scene, bdhc.geometry);
-      setInfo(`${bdhc.plates.length} plates, ${bdhc.points.length} points`);
-    } else {
-      // ─── Mode B: Flat grid with permission colors ──
-      buildFlatGrid(scene, tiles, gw, gh, TILE);
-      setInfo("Flat view (no BDHC data)");
+    // ─── Try NSBMD model rendering first ───
+    let hasNSBMD = false;
+    if (showModel && mapData?.modelData && mapData.modelData.byteLength > 16) {
+      try {
+        const nsbmd = parseNSBMD(mapData.modelData);
+        if (nsbmd && nsbmd.models.length > 0) {
+          const flat = nsbmdToFlatMesh(nsbmd);
+          if (flat && flat.positions.length > 0) {
+            buildNSBMDMesh(scene, flat, showWireframe);
+            hasNSBMD = true;
+            const triCount = flat.indices.length / 3;
+            infoStr += `Model: ${triCount} tris`;
+          }
+        }
+      } catch (e) {
+        console.warn("NSBMD parse error:", e);
+      }
     }
 
-    // Events
+    // ─── BDHC heightmap (if no NSBMD or as supplement) ───
+    if (bdhc && bdhc.geometry.length > 0) {
+      const heightmap = buildHeightmap(bdhc, gw, gh, TILE);
+      if (!hasNSBMD) {
+        buildHeightmapMesh(scene, heightmap, tiles, gw, gh, TILE);
+      }
+      buildPlateMeshes(scene, bdhc.geometry);
+      infoStr += `${infoStr ? " | " : ""}BDHC: ${bdhc.plates.length} plates`;
+    } else if (!hasNSBMD) {
+      // Flat grid fallback
+      buildFlatGrid(scene, tiles, gw, gh, TILE);
+      infoStr += "Flat view";
+    }
+
+    // ─── Buildings ───
+    if (mapData?.buildings && mapData.buildings.length > 0) {
+      buildBuildingMarkers(scene, mapData.buildings, TILE);
+      infoStr += ` | ${mapData.buildings.length} buildings`;
+    }
+
+    // ─── Events ───
     if (showEvents && eventData) {
       buildEventMarkers(scene, eventData, TILE);
     }
-  }, [bdhc, permissions, eventData, showEvents]);
 
-  // ─── Mouse handlers for orbit controls ────────
+    setInfo(infoStr || "No data");
+  }, [bdhc, permissions, eventData, showEvents, mapData, showModel, showWireframe]);
+
+  // ─── Mouse handlers ─────────────────────────────
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
     orbitRef.current.isDragging = true;
     orbitRef.current.lastX = e.clientX;
@@ -197,7 +235,6 @@ export default function MapView3D({ bdhc, permissions, eventData, showEvents }: 
     orbitRef.current.lastY = e.clientY;
 
     if (e.shiftKey || e.button === 1) {
-      // Pan
       const cam = cameraRef.current;
       if (!cam) return;
       const right = new THREE.Vector3();
@@ -208,7 +245,6 @@ export default function MapView3D({ bdhc, permissions, eventData, showEvents }: 
       orbitRef.current.target.add(right.multiplyScalar(-dx * 0.5));
       orbitRef.current.target.add(up.multiplyScalar(-dy * 0.5));
     } else {
-      // Rotate
       orbitRef.current.theta -= dx * 0.005;
       orbitRef.current.phi = Math.max(0.1, Math.min(Math.PI - 0.1, orbitRef.current.phi - dy * 0.005));
     }
@@ -236,13 +272,108 @@ export default function MapView3D({ bdhc, permissions, eventData, showEvents }: 
       <div className="canvas-info">
         {info} | Drag: orbit, Shift+Drag: pan, Scroll: zoom
       </div>
+      <div style={{ position: "absolute", top: 8, right: 8, display: "flex", gap: 4 }}>
+        <button
+          className={`tool-btn ${showModel ? "active" : ""}`}
+          onClick={() => setShowModel(m => !m)}
+          style={{ fontSize: 11, padding: "2px 8px" }}
+        >
+          Model
+        </button>
+        <button
+          className={`tool-btn ${showWireframe ? "active" : ""}`}
+          onClick={() => setShowWireframe(w => !w)}
+          style={{ fontSize: 11, padding: "2px 8px" }}
+        >
+          Wire
+        </button>
+      </div>
     </div>
   );
 }
 
-// ─── Mesh Builders ───────────────────────────────────────────
+// ─── NSBMD Mesh Builder ──────────────────────────────────────
 
-/** Build a heightmap-based terrain mesh colored by permission types. */
+function buildNSBMDMesh(
+  scene: THREE.Scene,
+  flat: { positions: Float32Array; normals: Float32Array; colors: Float32Array; indices: Uint32Array },
+  wireframe: boolean
+) {
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.BufferAttribute(flat.positions, 3));
+  geometry.setAttribute("normal", new THREE.BufferAttribute(flat.normals, 3));
+  geometry.setAttribute("color", new THREE.BufferAttribute(flat.colors, 3));
+  geometry.setIndex(new THREE.BufferAttribute(flat.indices, 1));
+  geometry.computeVertexNormals();
+
+  // NDS coordinate system: Y=up, X=right, Z=toward camera
+  // Three.js default is the same, but NDS models typically center at origin
+  // We need to scale and position to match our map grid (32×32 tiles, 16 units each = 512 total)
+
+  const material = wireframe
+    ? new THREE.MeshBasicMaterial({ vertexColors: true, wireframe: true })
+    : new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide });
+
+  const mesh = new THREE.Mesh(geometry, material);
+  mesh.receiveShadow = true;
+  mesh.castShadow = true;
+  mesh.userData.isMapMesh = true;
+
+  // Position to align with our grid (NDS map models are centered at 256,0,256 typically)
+  // The model coordinates are already in world space from the GPU commands
+  scene.add(mesh);
+}
+
+// ─── Building markers ────────────────────────────────────────
+
+function buildBuildingMarkers(scene: THREE.Scene, buildings: Building[], tileSize: number) {
+  const geometry = new THREE.BoxGeometry(12, 24, 12);
+
+  for (const b of buildings) {
+    const pos = getBuildingWorldPos(b);
+    // Convert from NDS coordinates to our scene coordinates
+    // NDS: X=right, Y=up-ish (actually depth in map), Z=height
+    // In DSPRE, X and Z are horizontal, Y is vertical
+    const material = new THREE.MeshLambertMaterial({
+      color: 0x8866aa,
+      transparent: true,
+      opacity: 0.7,
+    });
+
+    const mesh = new THREE.Mesh(geometry, material);
+    // Position: xPosition is in tile-relative units, multiply by tileSize
+    mesh.position.set(
+      pos.x * tileSize,
+      pos.z * tileSize,  // Z is height in NDS coordinates
+      pos.y * tileSize   // Y is depth in NDS coordinates
+    );
+
+    // Apply rotation
+    if (b.yRotation !== 0) {
+      mesh.rotation.y = (rotU16ToDeg(b.yRotation) * Math.PI) / 180;
+    }
+
+    // Scale based on width/height/length (default 16)
+    const sx = (b.width || 16) / 16;
+    const sy = (b.height || 16) / 16;
+    const sz = (b.length || 16) / 16;
+    mesh.scale.set(sx * 12, sy * 24, sz * 12);
+
+    mesh.castShadow = true;
+    mesh.userData.isBuildingMesh = true;
+
+    // Add wireframe outline
+    const wireGeo = new THREE.EdgesGeometry(geometry);
+    const wireMat = new THREE.LineBasicMaterial({ color: 0xaa88cc });
+    const wire = new THREE.LineSegments(wireGeo, wireMat);
+    mesh.add(wire);
+
+    scene.add(mesh);
+  }
+}
+
+// ─── Heightmap mesh ──────────────────────────────────────────
+
 function buildHeightmapMesh(
   scene: THREE.Scene,
   heights: Float32Array,
@@ -256,16 +387,12 @@ function buildHeightmapMesh(
   const colors: number[] = [];
   const indices: number[] = [];
 
-  // Create vertices for each grid corner
   for (let gy = 0; gy <= gh; gy++) {
     for (let gx = 0; gx <= gw; gx++) {
-      // Average height of surrounding tiles
-      let h = 0;
-      let count = 0;
+      let h = 0, count = 0;
       for (let dy = -1; dy <= 0; dy++) {
         for (let dx = -1; dx <= 0; dx++) {
-          const tx = gx + dx;
-          const ty = gy + dy;
+          const tx = gx + dx, ty = gy + dy;
           if (tx >= 0 && tx < gw && ty >= 0 && ty < gh) {
             h += heights[ty * gw + tx];
             count++;
@@ -273,28 +400,19 @@ function buildHeightmapMesh(
         }
       }
       h = count > 0 ? h / count : 0;
-
       vertices.push(gx * tileSize, h, gy * tileSize);
-
-      // Color from nearest tile
       const tx = Math.min(gx, gw - 1);
       const ty = Math.min(gy, gh - 1);
-      const permVal = tiles[ty * gw + tx];
-      const colorHex = getPermColor(permVal);
-      const c = new THREE.Color(colorHex);
+      const c = new THREE.Color(getPermColor(tiles[ty * gw + tx]));
       colors.push(c.r, c.g, c.b);
     }
   }
 
-  // Create triangles
   for (let gy = 0; gy < gh; gy++) {
     for (let gx = 0; gx < gw; gx++) {
       const i = gy * (gw + 1) + gx;
-      const i2 = i + 1;
-      const i3 = i + (gw + 1);
-      const i4 = i3 + 1;
-      indices.push(i, i3, i2); // tri 1
-      indices.push(i2, i3, i4); // tri 2
+      indices.push(i, i + (gw + 1), i + 1);
+      indices.push(i + 1, i + (gw + 1), i + (gw + 1) + 1);
     }
   }
 
@@ -303,49 +421,31 @@ function buildHeightmapMesh(
   geometry.setIndex(indices);
   geometry.computeVertexNormals();
 
-  const material = new THREE.MeshLambertMaterial({
-    vertexColors: true,
-    side: THREE.DoubleSide,
-  });
-
-  const mesh = new THREE.Mesh(geometry, material);
+  const mesh = new THREE.Mesh(geometry, new THREE.MeshLambertMaterial({
+    vertexColors: true, side: THREE.DoubleSide,
+  }));
   mesh.receiveShadow = true;
   mesh.userData.isMapMesh = true;
   scene.add(mesh);
 }
 
-/** Build wireframe outlines for each BDHC plate. */
 function buildPlateMeshes(scene: THREE.Scene, plates: PlateGeometry[]) {
   for (const plate of plates) {
     if (plate.vertices.length < 3) continue;
-
-    const points = plate.vertices.map(
-      (v) => new THREE.Vector3(v[0], v[1], v[2])
-    );
-    // Close the loop
+    const points = plate.vertices.map((v) => new THREE.Vector3(v[0], v[1], v[2]));
     points.push(points[0].clone());
-
     const geometry = new THREE.BufferGeometry().setFromPoints(points);
     const color = PLATE_COLORS[plate.type] ?? 0x7c3aed;
-    const material = new THREE.LineBasicMaterial({
-      color,
-      opacity: 0.5,
-      transparent: true,
-    });
-
-    const line = new THREE.Line(geometry, material);
+    const line = new THREE.Line(geometry, new THREE.LineBasicMaterial({
+      color, opacity: 0.5, transparent: true,
+    }));
     line.userData.isMapMesh = true;
     scene.add(line);
   }
 }
 
-/** Build a flat colored grid when no BDHC is available. */
 function buildFlatGrid(
-  scene: THREE.Scene,
-  tiles: Uint16Array,
-  gw: number,
-  gh: number,
-  tileSize: number
+  scene: THREE.Scene, tiles: Uint16Array, gw: number, gh: number, tileSize: number
 ) {
   const geometry = new THREE.BufferGeometry();
   const vertices: number[] = [];
@@ -376,23 +476,19 @@ function buildFlatGrid(
   geometry.computeVertexNormals();
 
   const mesh = new THREE.Mesh(geometry, new THREE.MeshLambertMaterial({
-    vertexColors: true,
-    side: THREE.DoubleSide,
+    vertexColors: true, side: THREE.DoubleSide,
   }));
   mesh.receiveShadow = true;
   mesh.userData.isMapMesh = true;
   scene.add(mesh);
 }
 
-/** Build event markers (spheres, diamonds, boxes) in 3D space. */
+// ─── Event markers ───────────────────────────────────────────
+
 function buildEventMarkers(scene: THREE.Scene, events: EventData, tileSize: number) {
   const addMarker = (
-    x: number,
-    y: number,
-    z: number,
-    color: number,
-    geo: THREE.BufferGeometry,
-    label?: string
+    x: number, y: number, z: number,
+    color: number, geo: THREE.BufferGeometry,
   ) => {
     const mat = new THREE.MeshLambertMaterial({ color, transparent: true, opacity: 0.8 });
     const mesh = new THREE.Mesh(geo, mat);
@@ -407,6 +503,9 @@ function buildEventMarkers(scene: THREE.Scene, events: EventData, tileSize: numb
   const diamondGeo = new THREE.OctahedronGeometry(7);
   const coneGeo = new THREE.ConeGeometry(5, 12, 4);
 
+  for (const sp of events.spawnables) {
+    addMarker(sp.x, sp.y, sp.z, 0x5f27cd, coneGeo);
+  }
   for (const ow of events.overworlds) {
     addMarker(ow.x, ow.y, ow.z, 0xee5a24, sphereGeo);
   }
@@ -415,13 +514,9 @@ function buildEventMarkers(scene: THREE.Scene, events: EventData, tileSize: numb
   }
   for (const tr of events.triggers) {
     const trigGeo = new THREE.BoxGeometry(
-      (tr.width || 1) * tileSize * 0.8,
-      6,
+      (tr.width || 1) * tileSize * 0.8, 6,
       (tr.height || 1) * tileSize * 0.8
     );
     addMarker(tr.x, tr.y, tr.z, 0x54a0ff, trigGeo);
-  }
-  for (const sg of events.signs) {
-    addMarker(sg.x, sg.y, sg.z, 0x5f27cd, coneGeo);
   }
 }
