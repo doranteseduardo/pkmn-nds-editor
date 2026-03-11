@@ -12,7 +12,8 @@ import type { PermissionGrid, Building, MapData } from "../lib/map-data";
 import { getPermColor, getBuildingWorldPos, rotU16ToDeg } from "../lib/map-data";
 import type { EventData } from "../lib/events";
 import { parseNSBMD, nsbmdToFlatMesh, type FlatMeshData } from "../lib/nsbmd";
-import type { TEX0Data } from "../lib/nsbtx";
+import { parseTEX0, type TEX0Data } from "../lib/nsbtx";
+import { BinaryReader } from "../lib/binary";
 
 interface Props {
   bdhc: BDHC | null;
@@ -20,6 +21,8 @@ interface Props {
   eventData: EventData | null;
   showEvents: boolean;
   mapData: MapData | null;
+  /** Raw NSBTX texture data from the ROM's map_tex NARC */
+  mapTexData: ArrayBuffer | null;
 }
 
 // ─── Plate type colors ──────────────────────────────────────
@@ -36,7 +39,7 @@ const PLATE_COLORS: Record<number, number> = {
 
 // ─── Component ───────────────────────────────────────────────
 
-export default function MapView3D({ bdhc, permissions, eventData, showEvents, mapData }: Props) {
+export default function MapView3D({ bdhc, permissions, eventData, showEvents, mapData, mapTexData }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
   const sceneRef = useRef<THREE.Scene | null>(null);
@@ -78,31 +81,13 @@ export default function MapView3D({ bdhc, permissions, eventData, showEvents, ma
     const renderer = new THREE.WebGLRenderer({ antialias: true });
     renderer.setSize(container.clientWidth, container.clientHeight);
     renderer.setPixelRatio(window.devicePixelRatio);
-    renderer.shadowMap.enabled = true;
-    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.shadowMap.enabled = false;
     container.appendChild(renderer.domElement);
     rendererRef.current = renderer;
 
-    // Lighting
-    const ambient = new THREE.AmbientLight(0x6677aa, 0.6);
+    // Flat global lighting — no shadows, even illumination
+    const ambient = new THREE.AmbientLight(0xffffff, 1.0);
     scene.add(ambient);
-
-    const sun = new THREE.DirectionalLight(0xffeedd, 1.0);
-    sun.position.set(200, 400, 150);
-    sun.castShadow = true;
-    sun.shadow.mapSize.width = 1024;
-    sun.shadow.mapSize.height = 1024;
-    sun.shadow.camera.near = 10;
-    sun.shadow.camera.far = 1200;
-    sun.shadow.camera.left = -600;
-    sun.shadow.camera.right = 600;
-    sun.shadow.camera.top = 600;
-    sun.shadow.camera.bottom = -600;
-    scene.add(sun);
-
-    const fill = new THREE.DirectionalLight(0x4488cc, 0.3);
-    fill.position.set(-100, 200, -200);
-    scene.add(fill);
 
     // Grid helper at y=0
     const grid = new THREE.GridHelper(512, 32, 0x333355, 0x222244);
@@ -185,7 +170,37 @@ export default function MapView3D({ bdhc, permissions, eventData, showEvents, ma
         if (nsbmd && nsbmd.models.length > 0) {
           const flat = nsbmdToFlatMesh(nsbmd);
           if (flat && flat.positions.length > 0) {
-            const bounds = buildNSBMDMesh(scene, flat, showWireframe, nsbmd.textures);
+            // Use embedded TEX0 from BMD0 if available, otherwise try external NSBTX
+            let textures = nsbmd.textures;
+            if (!textures && mapTexData && mapTexData.byteLength > 16) {
+              try {
+                // NSBTX files are BTX0 containers — same structure as BMD0:
+                // magic(4) + BOM(2) + ver(2) + size(4) + headerSize(2) + numBlocks(2) + blockOffsets
+                const r = new BinaryReader(mapTexData);
+                const magic = r.u32();
+                // BTX0 magic = 0x30585442 ("BTX0") or sometimes raw TEX0
+                if (magic === 0x30585442) { // "BTX0"
+                  r.skip(2 + 2 + 4 + 2); // BOM, ver, size, headerSize
+                  const numBlks = r.u16();
+                  for (let bi = 0; bi < numBlks; bi++) {
+                    const blkOff = r.u32();
+                    const savedPos = r.offset;
+                    textures = parseTEX0(mapTexData, blkOff);
+                    r.seek(savedPos);
+                    if (textures && textures.textures.length > 0) break;
+                  }
+                } else {
+                  // Maybe raw TEX0 block
+                  textures = parseTEX0(mapTexData, 0);
+                }
+                if (textures) {
+                  console.log(`[3D] Loaded external NSBTX: ${textures.textures.length} textures`);
+                }
+              } catch (e) {
+                console.warn("[3D] External NSBTX parse error:", e);
+              }
+            }
+            const bounds = buildNSBMDMesh(scene, flat, showWireframe, textures);
             hasNSBMD = true;
             const triCount = flat.indices.length / 3;
             infoStr += `Model: ${triCount} tris (${(flat.positions.length / 3)} verts)`;
@@ -239,7 +254,7 @@ export default function MapView3D({ bdhc, permissions, eventData, showEvents, ma
     }
 
     setInfo(infoStr || "No data");
-  }, [bdhc, permissions, eventData, showEvents, mapData, showModel, showWireframe]);
+  }, [bdhc, permissions, eventData, showEvents, mapData, mapTexData, showModel, showWireframe]);
 
   // ─── Mouse handlers ─────────────────────────────
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
@@ -326,9 +341,22 @@ function buildNSBMDMesh(
   const normalizedUvs = new Float32Array(flat.uvs.length);
   normalizedUvs.set(flat.uvs);
 
+  // Helper: find texture by name with fallback prefix matching
+  const findTexIdx = (name: string): number | undefined => {
+    if (!texData) return undefined;
+    // Exact match first
+    const exact = texData.textureMap.get(name);
+    if (exact !== undefined) return exact;
+    // Try prefix match (e.g., "tree04_2" could match "tree04")
+    for (const [tname, idx] of texData.textureMap) {
+      if (name.startsWith(tname) || tname.startsWith(name)) return idx;
+    }
+    return undefined;
+  };
+
   if (texData) {
     for (const mt of flat.meshTextures) {
-      const texIdx = texData.textureMap.get(mt.textureName);
+      const texIdx = findTexIdx(mt.textureName);
       if (texIdx !== undefined) {
         const tex = texData.textures[texIdx];
         // Convert texel coords to normalized UVs
@@ -386,9 +414,18 @@ function buildNSBMDMesh(
   if (!wireframe && flat.meshTextures.length > 0 && threeTextures.size > 0) {
     // Group geometry by texture for multi-material rendering
     for (const mt of flat.meshTextures) {
-      const tex = threeTextures.get(mt.textureName);
+      // Look up texture by exact name, then try prefix match
+      let tex = threeTextures.get(mt.textureName);
+      if (!tex) {
+        for (const [tname, t] of threeTextures) {
+          if (mt.textureName.startsWith(tname) || tname.startsWith(mt.textureName)) {
+            tex = t;
+            break;
+          }
+        }
+      }
       if (tex) {
-        materials.push(new THREE.MeshLambertMaterial({
+        materials.push(new THREE.MeshBasicMaterial({
           map: tex,
           vertexColors: true,
           side: THREE.DoubleSide,
@@ -396,13 +433,24 @@ function buildNSBMDMesh(
           alphaTest: 0.1,
         }));
       } else {
-        materials.push(new THREE.MeshLambertMaterial({
+        materials.push(new THREE.MeshBasicMaterial({
           vertexColors: true,
           side: THREE.DoubleSide,
         }));
       }
       geometry.addGroup(mt.indexStart, mt.indexCount, groupIndex++);
     }
+    const matched = materials.filter(m => (m as THREE.MeshBasicMaterial).map).length;
+    const unmatched = flat.meshTextures.filter(mt => {
+      let found = threeTextures.has(mt.textureName);
+      if (!found) {
+        for (const tname of threeTextures.keys()) {
+          if (mt.textureName.startsWith(tname) || tname.startsWith(mt.textureName)) { found = true; break; }
+        }
+      }
+      return !found;
+    }).map(mt => mt.textureName);
+    console.log(`[3D] Texture matching: ${matched}/${flat.meshTextures.length} matched, unmatched: ${unmatched.join(", ") || "none"}`);
   }
 
   let material: THREE.Material | THREE.Material[];
@@ -411,12 +459,11 @@ function buildNSBMDMesh(
   } else if (materials.length > 0) {
     material = materials;
   } else {
-    material = new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide });
+    material = new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide });
   }
 
   const mesh = new THREE.Mesh(geometry, material);
-  mesh.receiveShadow = true;
-  mesh.castShadow = true;
+
   mesh.userData.isMapMesh = true;
 
   // NDS coordinate system: Y=up, X=right, Z=into screen
@@ -440,28 +487,36 @@ function buildNSBMDMesh(
 
 function buildBuildingMarkers(scene: THREE.Scene, buildings: Building[], _tileSize: number) {
   // Shared geometry & materials — small pin markers (not to-scale boxes)
-  const pinGeo = new THREE.CylinderGeometry(2, 2, 1, 6);
-  const headGeo = new THREE.SphereGeometry(4, 8, 6);
-  const pinMat = new THREE.MeshLambertMaterial({ color: 0x9966cc, transparent: true, opacity: 0.85 });
-  const headMat = new THREE.MeshLambertMaterial({ color: 0xcc88ff, transparent: true, opacity: 0.85 });
+  const pinGeo = new THREE.CylinderGeometry(3, 3, 1, 6);
+  const headGeo = new THREE.SphereGeometry(6, 8, 6);
+  const pinMat = new THREE.MeshBasicMaterial({ color: 0x9966cc, transparent: true, opacity: 0.85 });
+  const headMat = new THREE.MeshBasicMaterial({ color: 0xcc88ff, transparent: true, opacity: 0.85 });
+
+  // Building positions are in a fixed-point coordinate system where ~1 unit ≈ 32 model-space units.
+  // The model coords span roughly -260 to 292 (512+ range for 32×32 tile map),
+  // while building positions span ~-6 to 6.
+  // Scale factor of 32 places buildings correctly within the model bounds.
+  const POS_SCALE = 32;
 
   for (const b of buildings) {
     const pos = getBuildingWorldPos(b);
-    // Building positions are in NDS world coordinates (same space as model).
-    // NSBMD mesh has scale.set(1,1,-1) for Z-flip, so building markers
-    // need the same flip: scene X = pos.x, scene Y = pos.y (height), scene Z = -pos.z
+    // Scale positions and flip Z to match the NSBMD mesh's scale.set(1,1,-1)
     const group = new THREE.Group();
-    group.position.set(pos.x, pos.y, -pos.z);
+    group.position.set(
+      pos.x * POS_SCALE,
+      pos.y * POS_SCALE,
+      -pos.z * POS_SCALE
+    );
 
     // Pin body
     const pin = new THREE.Mesh(pinGeo, pinMat);
-    pin.scale.set(1, 12, 1);
-    pin.position.y = 6;
+    pin.scale.set(1, 16, 1);
+    pin.position.y = 8;
     group.add(pin);
 
     // Pin head
     const head = new THREE.Mesh(headGeo, headMat);
-    head.position.y = 14;
+    head.position.y = 18;
     group.add(head);
 
     // Rotation
@@ -525,10 +580,9 @@ function buildHeightmapMesh(
   geometry.setIndex(indices);
   geometry.computeVertexNormals();
 
-  const mesh = new THREE.Mesh(geometry, new THREE.MeshLambertMaterial({
+  const mesh = new THREE.Mesh(geometry, new THREE.MeshBasicMaterial({
     vertexColors: true, side: THREE.DoubleSide,
   }));
-  mesh.receiveShadow = true;
   mesh.userData.isMapMesh = true;
   scene.add(mesh);
 }
@@ -579,10 +633,9 @@ function buildFlatGrid(
   geometry.setIndex(indices);
   geometry.computeVertexNormals();
 
-  const mesh = new THREE.Mesh(geometry, new THREE.MeshLambertMaterial({
+  const mesh = new THREE.Mesh(geometry, new THREE.MeshBasicMaterial({
     vertexColors: true, side: THREE.DoubleSide,
   }));
-  mesh.receiveShadow = true;
   mesh.userData.isMapMesh = true;
   scene.add(mesh);
 }
@@ -594,10 +647,9 @@ function buildEventMarkers(scene: THREE.Scene, events: EventData, tileSize: numb
     x: number, y: number, z: number,
     color: number, geo: THREE.BufferGeometry,
   ) => {
-    const mat = new THREE.MeshLambertMaterial({ color, transparent: true, opacity: 0.8 });
+    const mat = new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.8 });
     const mesh = new THREE.Mesh(geo, mat);
     mesh.position.set(x * tileSize + tileSize / 2, z + 12, y * tileSize + tileSize / 2);
-    mesh.castShadow = true;
     mesh.userData.isEventMesh = true;
     scene.add(mesh);
   };

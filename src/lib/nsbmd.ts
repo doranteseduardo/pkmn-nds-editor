@@ -144,7 +144,10 @@ function parseMDL0(r: BinaryReader, buffer: ArrayBuffer, blockOffset: number): N
   console.log(`[NSBMD] ${modelNames[0]}: ${polynum} polys, ${matnum} mats, scale=${modelScale.toFixed(2)}`);
 
   // Parse material dictionary to get texture names per material
-  const materialTexNames = parseMaterialDict(r, buffer, blockOffset, texpaloffset_base, modelOffsets[0], matnum);
+  // Try multiple strategies to find the material dict
+  const materialTexNames = parseMaterialSection(
+    r, buffer, blockOffset, texpaloffset_base, polyoffset_base, modelOffsets[0], matnum
+  );
 
   const models: NSBMDModel[] = [];
   for (let i = 0; i < num; i++) {
@@ -155,55 +158,63 @@ function parseMDL0(r: BinaryReader, buffer: ArrayBuffer, blockOffset: number): N
   return models;
 }
 
-// ─── Material Dictionary Parser ──────────────────────────────
+// ─── Material Section Parser ─────────────────────────────────
 
-function parseMaterialDict(
+function parseMaterialSection(
   r: BinaryReader, buffer: ArrayBuffer,
-  blockOffset: number, texpaloffset_base: number, modoffset: number,
-  matnum: number
+  blockOffset: number, texpaloffset_base: number, polyoffset_base: number,
+  modoffset: number, matnum: number
 ): string[] {
-  // Material dict is at blockOffset + texpaloffset_base + modoffset
-  // Similar to polygon dict location
   if (matnum === 0) return [];
 
-  const matDictOffset = blockOffset + texpaloffset_base + modoffset;
-  if (matDictOffset + 4 > buffer.byteLength) return [];
+  const dv = new DataView(buffer);
 
-  try {
-    r.seek(matDictOffset);
-    const dummy = r.u8();
-    const count = r.u8();
-    if (count === 0 || count > 64) return [];
+  // The material dict should be somewhere between blockOffset and the polygon dict.
+  // Scan the region for a valid dict header: dummy=0, count=matnum
+  const polyDictOffset = blockOffset + polyoffset_base + modoffset;
+  const scanStart = blockOffset + 8; // after MDL0 magic+size
+  const scanEnd = Math.min(polyDictOffset, buffer.byteLength - 4);
 
-    // Skip dict tree
-    r.skip(14 + count * 4);
+  console.log(`[NSBMD] Scanning for matDict (dummy=0, count=${matnum}) in range 0x${scanStart.toString(16)}..0x${scanEnd.toString(16)}`);
 
-    // Read material offsets (u32 each, relative to matDictOffset)
-    const matOffsets: number[] = [];
-    for (let i = 0; i < count; i++) matOffsets.push(r.u32());
+  for (let pos = scanStart; pos < scanEnd; pos++) {
+    const d = dv.getUint8(pos);
+    const c = dv.getUint8(pos + 1);
+    if (d === 0 && c === matnum) {
+      // Potential dict header found. Validate by checking if we can read names.
+      // A valid dict would have: 2 + (14 + c*4) + c*4 + c*16 bytes
+      const dictSize = 2 + 14 + c * 4 + c * 4 + c * 16;
+      if (pos + dictSize > buffer.byteLength) continue;
 
-    // Read material names (16 bytes each)
-    const matNames: string[] = [];
-    for (let i = 0; i < count; i++) matNames.push(readNdsString(r));
+      // Try to read material names and check if they look like valid NDS names
+      const nameStart = pos + 2 + (14 + c * 4) + c * 4;
+      let validNames = 0;
+      const names: string[] = [];
+      for (let i = 0; i < c; i++) {
+        const nameOff = nameStart + i * 16;
+        let name = "";
+        for (let b = 0; b < 16; b++) {
+          const ch = dv.getUint8(nameOff + b);
+          if (ch === 0) break;
+          if (ch >= 0x20 && ch < 0x7F) name += String.fromCharCode(ch);
+          else { name = ""; break; }
+        }
+        if (name.length >= 2) validNames++;
+        names.push(name);
+      }
 
-    // Material headers: each starts with some fields, including texture name index
-    // For now, use material names as a proxy — in many NDS models, material name = texture name
-    // We'll also try to read the actual texture reference from material data
-
-    // Try reading material data entries to find texture indices
-    // Material data structure varies, but typically contains:
-    //   - Various rendering parameters
-    //   - Texture index (references TEX0 dictionary)
-    //   - Palette index
-    // The exact structure is complex and model-dependent.
-    // For DPPt maps, material names typically match texture names.
-
-    console.log(`[NSBMD] Materials: ${matNames.join(", ")}`);
-    return matNames;
-  } catch (e) {
-    console.warn("[NSBMD] Material dict parse error:", e);
-    return [];
+      if (validNames >= c * 0.5) {
+        // Strip NDS material suffixes like _lm2, _lm1 to get texture name
+        const texNames = names.map(n => n.replace(/_lm\d+$/, ""));
+        console.log(`[NSBMD] Found matDict at 0x${pos.toString(16)}: ${names.join(", ")}`);
+        console.log(`[NSBMD] Texture refs: ${texNames.join(", ")}`);
+        return texNames;
+      }
+    }
   }
+
+  console.warn(`[NSBMD] Material dict not found by scanning`);
+  return [];
 }
 
 // ─── Model Parser ────────────────────────────────────────────
@@ -237,7 +248,10 @@ function parseModel(
   }
 
   // Read polygon names
-  for (let j = 0; j < polynum; j++) readNdsString(r);
+  const polyNames: string[] = [];
+  for (let j = 0; j < polynum; j++) polyNames.push(readNdsString(r));
+
+  console.log(`[NSBMD] Polygon names: ${polyNames.join(", ")}`);
 
   // Read polygon headers (16 bytes each, sequentially after names)
   const polyDataSizes: number[] = [];
@@ -260,9 +274,13 @@ function parseModel(
 
     if (dlSize === 0 || dlSize > 500000 || dlOffset + dlSize > buffer.byteLength) continue;
 
-    // Try to find texture name for this polygon
-    // In many NDS models, polygon index maps to material index
-    const texName = j < materialTexNames.length ? materialTexNames[j] : "";
+    // Determine texture name for this polygon:
+    // 1. From material dict if available
+    // 2. Fall back to polygon name (in DPPt maps, polygon names often match texture names)
+    let texName = j < materialTexNames.length ? materialTexNames[j] : "";
+    if (!texName && j < polyNames.length) {
+      texName = polyNames[j];
+    }
 
     const decoded = decodeDisplayList(new Uint8Array(buffer, dlOffset, dlSize), scale);
     for (const dm of decoded) {

@@ -54,6 +54,10 @@ export default function App() {
   const [eventNarc, setEventNarc] = useState<NARC | null>(null);
   const [matrixNarc, setMatrixNarc] = useState<NARC | null>(null);
   const [encounterNarc, setEncounterNarc] = useState<NARC | null>(null);
+  const [mapTexNarc, setMapTexNarc] = useState<NARC | null>(null);
+
+  /** Raw NSBTX texture data for the currently loaded map */
+  const [mapTexData, setMapTexData] = useState<ArrayBuffer | null>(null);
 
   // Current map
   const [currentMapIdx, setCurrentMapIdx] = useState<number | null>(null);
@@ -113,17 +117,20 @@ export default function App() {
       const events = tryExtractNarc(paths.eventData);
       const matrix = tryExtractNarc(paths.mapMatrix);
       const encounters = tryExtractNarc(paths.encounterData);
+      const mapTex = tryExtractNarc(paths.mapTex);
 
       setLandNarc(land);
       setEventNarc(events);
       setMatrixNarc(matrix);
       setEncounterNarc(encounters);
+      setMapTexNarc(mapTex);
+      if (mapTex) console.log(`[ROM] Map texture NARC: ${mapTex.fileCount} texture sets`);
 
       if (land) addToast(`Found ${land.fileCount} maps`, "success");
       if (matrix?.files[0]) setMatrixData(parseMapMatrix(matrix.files[0].data));
 
       if (land && land.fileCount > 0) {
-        loadMapInternal(0, land, events, encounters);
+        loadMapInternal(0, land, events, encounters, mapTex);
       }
     } catch (err) {
       addToast(`Error: ${(err as Error).message}`, "error");
@@ -134,7 +141,7 @@ export default function App() {
 
   // ─── Load map ──────────────────────────────────
   const loadMapInternal = useCallback(
-    (idx: number, ln: NARC | null, en: NARC | null, ec: NARC | null) => {
+    (idx: number, ln: NARC | null, en: NARC | null, ec: NARC | null, mt: NARC | null = null) => {
       if (!ln || idx >= ln.fileCount) return;
       const md = modifiedMaps[idx]
         ? parseMapData(modifiedMaps[idx])
@@ -161,6 +168,15 @@ export default function App() {
         setEncounterData(null);
       }
 
+      // Load map texture NSBTX from the texture NARC
+      // For now, try idx as the texture set index (proper mapping via area_data TODO)
+      if (mt && idx < mt.fileCount && mt.files[idx].data.byteLength > 16) {
+        setMapTexData(mt.files[idx].data);
+        console.log(`[ROM] Loaded map texture set #${idx}: ${mt.files[idx].data.byteLength} bytes`);
+      } else {
+        setMapTexData(null);
+      }
+
       setCurrentMapIdx(idx);
       setSelectedEvent(null);
     },
@@ -168,8 +184,8 @@ export default function App() {
   );
 
   const loadMap = useCallback(
-    (idx: number) => loadMapInternal(idx, landNarc, eventNarc, encounterNarc),
-    [landNarc, eventNarc, encounterNarc, loadMapInternal]
+    (idx: number) => loadMapInternal(idx, landNarc, eventNarc, encounterNarc, mapTexNarc),
+    [landNarc, eventNarc, encounterNarc, mapTexNarc, loadMapInternal]
   );
 
   // ─── Permission editing ────────────────────────
@@ -428,6 +444,7 @@ export default function App() {
                     eventData={eventData}
                     showEvents={showLayers.events}
                     mapData={mapData}
+                    mapTexData={mapTexData}
                   />
                 )}
                 <RightPanel

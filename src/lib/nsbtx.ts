@@ -58,7 +58,7 @@ export function parseTEX0(buffer: ArrayBuffer, blockOffset: number): TEX0Data | 
 
   // Texture section header
   r.u16();                              // texDataSize >> 3
-  const texInfoOffset = r.u16();       // relative to TEX0 + 8 (after magic+size)
+  const texInfoOffset = r.u16();       // relative to TEX0 start
   r.skip(4); // padding
   const texDataOffset = r.u32();       // relative to TEX0 start
   r.skip(4); // padding
@@ -82,8 +82,8 @@ export function parseTEX0(buffer: ArrayBuffer, blockOffset: number): TEX0Data | 
   console.log(`[TEX0] texData=0x${texDataAbsolute.toString(16)}, palData=0x${palDataAbsolute.toString(16)}, texInfo=0x${texInfoOffset.toString(16)}, palInfo=0x${palInfoOffset.toString(16)}`);
 
   // ─── Parse texture info dictionary ───
-  // texInfoOffset is relative to TEX0+8 (start of data section after magic+blockSize)
-  const texInfoAbsolute = blockOffset + 8 + texInfoOffset;
+  // texInfoOffset is relative to TEX0 block start (same as palInfoOffset)
+  const texInfoAbsolute = blockOffset + texInfoOffset;
   const texEntries = parseTexInfoDict(r, buffer, texInfoAbsolute);
 
   // ─── Parse palette info dictionary ───
@@ -125,6 +125,14 @@ export function parseTEX0(buffer: ArrayBuffer, blockOffset: number): TEX0Data | 
       }
     }
 
+    console.log(`[TEX0] Decoding "${tex.name}": ${width}x${height} fmt=${format} texData=0x${texDataStart.toString(16)} palData=0x${palDataStart.toString(16)} bufLen=${buffer.byteLength}`);
+
+    // Bounds check before decode
+    if (texDataStart >= buffer.byteLength) {
+      console.warn(`[TEX0]   texDataStart 0x${texDataStart.toString(16)} out of bounds`);
+      continue;
+    }
+
     const rgba = decodeTexture(
       buffer, texDataStart, palDataStart,
       width, height, format, color0Transparent !== 0
@@ -133,7 +141,9 @@ export function parseTEX0(buffer: ArrayBuffer, blockOffset: number): TEX0Data | 
     if (rgba) {
       textureMap.set(tex.name, textures.length);
       textures.push({ name: tex.name, width, height, format, rgba });
-      console.log(`[TEX0]   "${tex.name}": ${width}x${height}, fmt=${format}, vram=0x${vramOffset.toString(16)}`);
+      console.log(`[TEX0]   OK: "${tex.name}" decoded ${width}x${height}`);
+    } else {
+      console.warn(`[TEX0]   FAILED to decode "${tex.name}" ${width}x${height} fmt=${format}`);
     }
   }
 
@@ -157,14 +167,15 @@ function parseTexInfoDict(r: BinaryReader, buffer: ArrayBuffer, dictOffset: numb
   if (dictOffset + 4 > buffer.byteLength) return [];
   r.seek(dictOffset);
 
-  r.u8();  // dummy
+  const dummy = r.u8();
   const count = r.u8();
   if (count === 0 || count > 256) return [];
 
-  // dictSize: total size of dict header from this point
-  // Data entries start at dictOffset + 2 + dictSize
-  const dictSize = r.u16();
-  r.seek(dictOffset + 2 + dictSize);
+  console.log(`[TEX0] TexInfoDict at 0x${dictOffset.toString(16)}: dummy=${dummy}, count=${count}`);
+
+  // Use DSPRE-verified hardcoded skip: 14 + count*4 bytes for the dict tree
+  // (same formula that works for MDL0 polygon/model dicts)
+  r.skip(14 + count * 4);
 
   // Each texture info entry: 8 bytes (u32 params + u32 extra)
   const entries: TexInfoEntry[] = [];
@@ -173,11 +184,18 @@ function parseTexInfoDict(r: BinaryReader, buffer: ArrayBuffer, dictOffset: numb
     const params = r.u32();
     const extra = r.u32();
     entries.push({ name: "", params, extra });
+
+    const format = (params >>> 26) & 7;
+    const wShift = (params >>> 20) & 7;
+    const hShift = (params >>> 23) & 7;
+    const vram = (params & 0xFFFF) << 3;
+    console.log(`[TEX0]   texEntry[${i}]: params=0x${params.toString(16)}, fmt=${format}, ${8 << wShift}x${8 << hShift}, vram=0x${vram.toString(16)}`);
   }
 
   // Names: 16 bytes each
   for (let i = 0; i < count && i < entries.length; i++) {
     entries[i].name = readNdsString16(r);
+    console.log(`[TEX0]   texName[${i}]: "${entries[i].name}"`);
   }
 
   return entries;
@@ -187,12 +205,14 @@ function parsePalInfoDict(r: BinaryReader, buffer: ArrayBuffer, dictOffset: numb
   if (dictOffset + 4 > buffer.byteLength) return [];
   r.seek(dictOffset);
 
-  r.u8(); // dummy
+  const dummy = r.u8();
   const count = r.u8();
   if (count === 0 || count > 256) return [];
 
-  const dictSize = r.u16();
-  r.seek(dictOffset + 2 + dictSize);
+  console.log(`[TEX0] PalInfoDict at 0x${dictOffset.toString(16)}: dummy=${dummy}, count=${count}`);
+
+  // Use hardcoded skip for dict tree
+  r.skip(14 + count * 4);
 
   // Each palette info entry: 4 bytes (u16 offset<<3 + u16 unknown)
   const entries: PalInfoEntry[] = [];

@@ -332,5 +332,11 @@ export function getGamePaths(version: GameInfo["version"]) {
         : version === "pearl"
         ? "fielddata/encountdata/p_enc_data.narc"
         : "fielddata/encountdata/pl_enc_data.narc",
+    /** Map texture NARC — NSBTX files indexed by area_data's map_tex_set ID */
+    mapTex: "fielddata/areadata/area_map_tex/map_tex_set.narc",
+    /** Area data NARC — maps zone headers to texture set indices */
+    areaData: isDPt
+      ? "fielddata/areadata/area_data.narc"
+      : "fielddata/areadata/area_data_release.narc",
   };
 }
