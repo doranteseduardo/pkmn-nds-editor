@@ -69,8 +69,8 @@ export default function MapView3D({ bdhc, permissions, eventData, showEvents, ma
     const camera = new THREE.PerspectiveCamera(
       50,
       container.clientWidth / container.clientHeight,
-      1,
-      2000
+      0.1,
+      5000
     );
     cameraRef.current = camera;
 
@@ -181,10 +181,27 @@ export default function MapView3D({ bdhc, permissions, eventData, showEvents, ma
         if (nsbmd && nsbmd.models.length > 0) {
           const flat = nsbmdToFlatMesh(nsbmd);
           if (flat && flat.positions.length > 0) {
-            buildNSBMDMesh(scene, flat, showWireframe);
+            const bounds = buildNSBMDMesh(scene, flat, showWireframe);
             hasNSBMD = true;
             const triCount = flat.indices.length / 3;
-            infoStr += `Model: ${triCount} tris`;
+            infoStr += `Model: ${triCount} tris (${(flat.positions.length / 3)} verts)`;
+
+            // Auto-adjust camera to fit model bounds
+            if (bounds) {
+              const center = new THREE.Vector3(
+                (bounds.min.x + bounds.max.x) / 2,
+                (bounds.min.y + bounds.max.y) / 2,
+                (bounds.min.z + bounds.max.z) / 2
+              );
+              const size = Math.max(
+                bounds.max.x - bounds.min.x,
+                bounds.max.y - bounds.min.y,
+                bounds.max.z - bounds.min.z
+              );
+              orbitRef.current.target.copy(center);
+              orbitRef.current.radius = Math.max(size * 1.5, 20);
+              console.log(`[3D] Model bounds: min=(${bounds.min.x.toFixed(1)},${bounds.min.y.toFixed(1)},${bounds.min.z.toFixed(1)}), max=(${bounds.max.x.toFixed(1)},${bounds.max.y.toFixed(1)},${bounds.max.z.toFixed(1)}), radius=${orbitRef.current.radius.toFixed(1)}`);
+            }
           }
         }
       } catch (e) {
@@ -298,17 +315,14 @@ function buildNSBMDMesh(
   scene: THREE.Scene,
   flat: { positions: Float32Array; normals: Float32Array; colors: Float32Array; indices: Uint32Array },
   wireframe: boolean
-) {
+): { min: THREE.Vector3; max: THREE.Vector3 } | null {
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute("position", new THREE.BufferAttribute(flat.positions, 3));
   geometry.setAttribute("normal", new THREE.BufferAttribute(flat.normals, 3));
   geometry.setAttribute("color", new THREE.BufferAttribute(flat.colors, 3));
   geometry.setIndex(new THREE.BufferAttribute(flat.indices, 1));
   geometry.computeVertexNormals();
-
-  // NDS coordinate system: Y=up, X=right, Z=toward camera
-  // Three.js default is the same, but NDS models typically center at origin
-  // We need to scale and position to match our map grid (32×32 tiles, 16 units each = 512 total)
+  geometry.computeBoundingBox();
 
   const material = wireframe
     ? new THREE.MeshBasicMaterial({ vertexColors: true, wireframe: true })
@@ -319,9 +333,21 @@ function buildNSBMDMesh(
   mesh.castShadow = true;
   mesh.userData.isMapMesh = true;
 
-  // Position to align with our grid (NDS map models are centered at 256,0,256 typically)
-  // The model coordinates are already in world space from the GPU commands
+  // NDS coordinate system: Y=up, X=right, Z=into screen
+  // Three.js: Y=up, X=right, Z=out of screen (right-handed)
+  // NDS uses left-handed, so we flip Z
+  mesh.scale.set(1, 1, -1);
+
   scene.add(mesh);
+
+  if (geometry.boundingBox) {
+    const bb = geometry.boundingBox;
+    return {
+      min: new THREE.Vector3(bb.min.x, bb.min.y, -bb.max.z),
+      max: new THREE.Vector3(bb.max.x, bb.max.y, -bb.min.z),
+    };
+  }
+  return null;
 }
 
 // ─── Building markers ────────────────────────────────────────
