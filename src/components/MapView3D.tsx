@@ -400,8 +400,8 @@ function buildNSBMDMesh(
       dataTex.minFilter = THREE.NearestFilter;
       dataTex.wrapS = THREE.RepeatWrapping;
       dataTex.wrapT = THREE.RepeatWrapping;
-      // NDS textures are stored top-to-bottom, Three.js expects bottom-to-top
-      dataTex.flipY = true;
+      // DataTexture default is flipY=false which matches NDS top-to-bottom storage
+      dataTex.flipY = false;
       threeTextures.set(tex.name, dataTex);
     }
     console.log(`[3D] Created ${threeTextures.size} Three.js textures`);

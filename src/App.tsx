@@ -1,6 +1,7 @@
 import { useState, useCallback, useEffect } from "react";
 import {
   parseNDSRom, findFile, extractFile, getGamePaths, patchFile,
+  getAreaDataIdFromArm9,
   type NDSRom, type FileNode,
 } from "./lib/nds-rom";
 import { parseNARC, rebuildNARC, type NARC } from "./lib/narc";
@@ -55,6 +56,7 @@ export default function App() {
   const [matrixNarc, setMatrixNarc] = useState<NARC | null>(null);
   const [encounterNarc, setEncounterNarc] = useState<NARC | null>(null);
   const [mapTexNarc, setMapTexNarc] = useState<NARC | null>(null);
+  const [areaDataNarc, setAreaDataNarc] = useState<NARC | null>(null);
 
   /** Raw NSBTX texture data for the currently loaded map */
   const [mapTexData, setMapTexData] = useState<ArrayBuffer | null>(null);
@@ -118,19 +120,50 @@ export default function App() {
       const matrix = tryExtractNarc(paths.mapMatrix);
       const encounters = tryExtractNarc(paths.encounterData);
       const mapTex = tryExtractNarc(paths.mapTex);
+      const areaData = tryExtractNarc(paths.areaData);
 
       setLandNarc(land);
       setEventNarc(events);
       setMatrixNarc(matrix);
       setEncounterNarc(encounters);
       setMapTexNarc(mapTex);
+      setAreaDataNarc(areaData);
+      // Log ARM9 info for header table lookup
+      console.log(`[ROM] Game code: ${parsed.gameCode}, ARM9 offset: 0x${parsed.arm9Offset.toString(16)}, ARM9 size: 0x${parsed.arm9Size.toString(16)}`);
+      // Test first few map header lookups
+      for (let i = 0; i < Math.min(5, land?.fileCount ?? 0); i++) {
+        const areaId = getAreaDataIdFromArm9(parsed.buffer, parsed.arm9Offset, parsed.arm9Size, parsed.gameCode, i);
+        console.log(`[ROM] Map header[${i}] → areaDataID=${areaId}`);
+      }
+
       if (mapTex) console.log(`[ROM] Map texture NARC: ${mapTex.fileCount} texture sets`);
+      if (areaData) {
+        // Dump first few entries to understand format
+        const sizes = new Set<number>();
+        for (let i = 0; i < Math.min(10, areaData.fileCount); i++) {
+          sizes.add(areaData.files[i].data.byteLength);
+        }
+        console.log(`[ROM] Area data NARC: ${areaData.fileCount} entries, sizes: ${[...sizes].join(",")}`);
+        // Hex dump first 3 entries
+        for (let i = 0; i < Math.min(3, areaData.fileCount); i++) {
+          const dv = new DataView(areaData.files[i].data);
+          const hex: string[] = [];
+          for (let b = 0; b < Math.min(16, areaData.files[i].data.byteLength); b++) {
+            hex.push(dv.getUint8(b).toString(16).padStart(2, "0"));
+          }
+          const u16s: string[] = [];
+          for (let b = 0; b + 1 < areaData.files[i].data.byteLength; b += 2) {
+            u16s.push(dv.getUint16(b, true).toString());
+          }
+          console.log(`[ROM] AreaData[${i}]: hex=${hex.join(" ")}, u16s=[${u16s.join(",")}]`);
+        }
+      }
 
       if (land) addToast(`Found ${land.fileCount} maps`, "success");
       if (matrix?.files[0]) setMatrixData(parseMapMatrix(matrix.files[0].data));
 
       if (land && land.fileCount > 0) {
-        loadMapInternal(0, land, events, encounters, mapTex);
+        loadMapInternal(0, land, events, encounters, mapTex, areaData, parsed);
       }
     } catch (err) {
       addToast(`Error: ${(err as Error).message}`, "error");
@@ -141,7 +174,8 @@ export default function App() {
 
   // ─── Load map ──────────────────────────────────
   const loadMapInternal = useCallback(
-    (idx: number, ln: NARC | null, en: NARC | null, ec: NARC | null, mt: NARC | null = null) => {
+    (idx: number, ln: NARC | null, en: NARC | null, ec: NARC | null,
+     mt: NARC | null = null, ad: NARC | null = null, romRef: NDSRom | null = null) => {
       if (!ln || idx >= ln.fileCount) return;
       const md = modifiedMaps[idx]
         ? parseMapData(modifiedMaps[idx])
@@ -168,11 +202,53 @@ export default function App() {
         setEncounterData(null);
       }
 
-      // Load map texture NSBTX from the texture NARC
-      // For now, try idx as the texture set index (proper mapping via area_data TODO)
-      if (mt && idx < mt.fileCount && mt.files[idx].data.byteLength > 16) {
-        setMapTexData(mt.files[idx].data);
-        console.log(`[ROM] Loaded map texture set #${idx}: ${mt.files[idx].data.byteLength} bytes`);
+      // ── Two-level indirection for texture set lookup ──
+      // Step 1: Read map header from ARM9 → get areaDataID
+      // Step 2: Use areaDataID to index into area_data NARC → get mapTileset
+      // Step 3: Use mapTileset to index into map_tex NARC
+      let texSetIdx = 0; // fallback
+      let areaDataID: number | null = null;
+
+      if (romRef) {
+        areaDataID = getAreaDataIdFromArm9(
+          romRef.buffer, romRef.arm9Offset, romRef.arm9Size,
+          romRef.gameCode, idx
+        );
+        if (areaDataID !== null) {
+          console.log(`[ROM] Map ${idx} → ARM9 header → areaDataID=${areaDataID}`);
+        }
+      }
+
+      if (areaDataID !== null && ad && areaDataID < ad.fileCount) {
+        // Read area_data entry: [buildingsTileset u16, mapTileset u16, unknown u16, lightType u16]
+        const adData = new DataView(ad.files[areaDataID].data);
+        if (adData.byteLength >= 4) {
+          const buildingsTileset = adData.getUint16(0, true);
+          const mapTileset = adData.getUint16(2, true);
+          console.log(`[ROM] AreaData[${areaDataID}]: buildingsTileset=${buildingsTileset}, mapTileset=${mapTileset}`);
+          if (mt && mapTileset < mt.fileCount) {
+            texSetIdx = mapTileset;
+          } else if (mt && buildingsTileset < mt.fileCount) {
+            texSetIdx = buildingsTileset;
+          }
+        }
+      } else {
+        // Fallback: use map index directly as area_data index (old behavior)
+        console.warn(`[ROM] No ARM9 header lookup for map ${idx}, falling back to direct index`);
+        if (ad && idx < ad.fileCount) {
+          const adData = new DataView(ad.files[idx].data);
+          if (adData.byteLength >= 4) {
+            const field0 = adData.getUint16(0, true);
+            const field1 = adData.getUint16(2, true);
+            if (mt && field1 < mt.fileCount) texSetIdx = field1;
+            else if (mt && field0 < mt.fileCount) texSetIdx = field0;
+          }
+        }
+      }
+
+      if (mt && texSetIdx < mt.fileCount && mt.files[texSetIdx].data.byteLength > 16) {
+        setMapTexData(mt.files[texSetIdx].data);
+        console.log(`[ROM] Loaded map texture set #${texSetIdx}: ${mt.files[texSetIdx].data.byteLength} bytes`);
       } else {
         setMapTexData(null);
       }
@@ -184,8 +260,8 @@ export default function App() {
   );
 
   const loadMap = useCallback(
-    (idx: number) => loadMapInternal(idx, landNarc, eventNarc, encounterNarc, mapTexNarc),
-    [landNarc, eventNarc, encounterNarc, mapTexNarc, loadMapInternal]
+    (idx: number) => loadMapInternal(idx, landNarc, eventNarc, encounterNarc, mapTexNarc, areaDataNarc, rom),
+    [landNarc, eventNarc, encounterNarc, mapTexNarc, areaDataNarc, rom, loadMapInternal]
   );
 
   // ─── Permission editing ────────────────────────

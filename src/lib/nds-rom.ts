@@ -315,6 +315,114 @@ export function patchFile(
   return { success: true, truncated: true };
 }
 
+// ─── ARM9 Map Header Table ────────────────────────────────────
+
+/**
+ * DPPt map header table offsets within the ARM9 binary.
+ * Each entry is 24 bytes (0x18). The areaDataID is at byte offset 0x0.
+ * Keyed by 4-character game code.
+ * Source: DSPRE RomInfo.cs headerTableOffset values.
+ */
+const HEADER_TABLE_OFFSETS: Record<string, number> = {
+  // Diamond
+  ADAE: 0xEEDBC,  // US/EN
+  ADAS: 0xEEE08,  // ES
+  ADAI: 0xEED70,  // IT
+  ADAF: 0xEEDFC,  // FR
+  ADAD: 0xEEDCC,  // DE
+  ADAP: 0xEEDBC,  // EU (same as US for English-based EU)
+  ADAJ: 0xF0D68,  // JP (Diamond)
+  ADAK: 0xEEDBC,  // KR (fallback to US)
+  // Pearl
+  APAE: 0xEEDBC,  // US/EN
+  APAS: 0xEEE08,  // ES
+  APAI: 0xEED70,  // IT
+  APAF: 0xEEDFC,  // FR
+  APAD: 0xEEDCC,  // DE
+  APAP: 0xEEDBC,  // EU
+  APAJ: 0xF0D6C,  // JP (Pearl)
+  APAK: 0xEEDBC,  // KR
+  // Platinum
+  CPUE: 0xE601C,  // US/EN
+  CPUS: 0xE60B0,  // ES
+  CPUI: 0xE6038,  // IT
+  CPUF: 0xE60A4,  // FR
+  CPUD: 0xE6074,  // DE
+  CPUP: 0xE601C,  // EU
+  CPUJ: 0xE56F0,  // JP
+  CPUK: 0xE601C,  // KR
+};
+
+const MAP_HEADER_SIZE = 24; // 0x18 bytes per header
+
+/**
+ * Read a map header entry from the ARM9 binary embedded in the ROM.
+ * Returns the areaDataID (byte at offset 0x0 of the 24-byte header).
+ * Returns null if the offset can't be resolved.
+ */
+export function getAreaDataIdFromArm9(
+  romBuffer: ArrayBuffer,
+  arm9Offset: number,
+  arm9Size: number,
+  gameCode: string,
+  mapHeaderIndex: number
+): number | null {
+  const tableOffset = HEADER_TABLE_OFFSETS[gameCode];
+  if (tableOffset === undefined) {
+    console.warn(`[ARM9] No header table offset for game code: ${gameCode}`);
+    return null;
+  }
+
+  const entryOffset = tableOffset + MAP_HEADER_SIZE * mapHeaderIndex;
+
+  // Bounds check within ARM9
+  if (entryOffset + MAP_HEADER_SIZE > arm9Size) {
+    console.warn(`[ARM9] Header entry ${mapHeaderIndex} at 0x${entryOffset.toString(16)} exceeds ARM9 size 0x${arm9Size.toString(16)}`);
+    return null;
+  }
+
+  const absoluteOffset = arm9Offset + entryOffset;
+  if (absoluteOffset + MAP_HEADER_SIZE > romBuffer.byteLength) {
+    console.warn(`[ARM9] Absolute offset 0x${absoluteOffset.toString(16)} exceeds ROM size`);
+    return null;
+  }
+
+  const dv = new DataView(romBuffer);
+  const areaDataID = dv.getUint8(absoluteOffset); // byte at offset 0x0
+  return areaDataID;
+}
+
+/**
+ * Read ALL map headers from ARM9, returning an array of areaDataIDs.
+ * Reads headers until we hit obviously invalid data or reach ARM9 bounds.
+ */
+export function getAllAreaDataIds(
+  romBuffer: ArrayBuffer,
+  arm9Offset: number,
+  arm9Size: number,
+  gameCode: string,
+  maxHeaders: number = 600
+): number[] {
+  const tableOffset = HEADER_TABLE_OFFSETS[gameCode];
+  if (tableOffset === undefined) return [];
+
+  const result: number[] = [];
+  const dv = new DataView(romBuffer);
+
+  for (let i = 0; i < maxHeaders; i++) {
+    const entryOffset = tableOffset + MAP_HEADER_SIZE * i;
+    if (entryOffset + MAP_HEADER_SIZE > arm9Size) break;
+
+    const absoluteOffset = arm9Offset + entryOffset;
+    if (absoluteOffset + MAP_HEADER_SIZE > romBuffer.byteLength) break;
+
+    const areaDataID = dv.getUint8(absoluteOffset);
+    result.push(areaDataID);
+  }
+
+  return result;
+}
+
 /** Get NARC paths for a given game version. */
 export function getGamePaths(version: GameInfo["version"]) {
   const isDPt = version === "diamond" || version === "pearl";
