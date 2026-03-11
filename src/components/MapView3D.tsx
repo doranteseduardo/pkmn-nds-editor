@@ -272,7 +272,8 @@ export default function MapView3D({ bdhc, permissions, eventData, showEvents, ma
   }, []);
 
   const handleWheel = useCallback((e: React.WheelEvent) => {
-    orbitRef.current.radius = Math.max(50, Math.min(1500, orbitRef.current.radius + e.deltaY * 0.5));
+    const r = orbitRef.current.radius;
+    orbitRef.current.radius = Math.max(5, Math.min(3000, r + e.deltaY * r * 0.001));
   }, []);
 
   return (

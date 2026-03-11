@@ -3,14 +3,13 @@
  * Decodes NDS 3D models from GPU display list commands into triangle meshes
  * suitable for Three.js rendering.
  *
- * Based on DSPRE's NSBMD.cs exact byte-level layout.
- *
- * Key offset rules (from DSPRE):
- *   - MDL0 model dict entries (modoffset) are used directly (NOT added to blockOffset)
- *   - polyoffset = polyoffset_base + modoffset  (absolute in buffer)
- *   - polyOffsets[j] = dictEntry + polyoffset    (absolute in buffer)
- *   - dlAbsOffset = polyOffsets[j] + headerDataOffset
- *   - Model header is read SEQUENTIALLY after the dict, not by seeking to modoffset
+ * Offset rules (verified against real DPPt map data):
+ *   - Dict navigation: skip(1) + readByte(count) + skip(14 + count*4) + offsets + names
+ *   - Model header: 0x38 bytes, polyoffset_base at +0x0C
+ *   - polyoffset = blockOffset + polyoffset_base + modoffset  (all three summed)
+ *   - Polygon dict: skip(1) + readByte() + skip(14 + polynum*4) + offsets + names + headers
+ *   - polyOffsets[j] = dictEntry + polyoffset
+ *   - dlOffset = polyOffsets[j] + headerDataOffset
  */
 
 import { BinaryReader } from "./binary";
@@ -39,64 +38,13 @@ export interface NSBMDFile {
 const BMD0_MAGIC = 0x30444D42; // "BMD0"
 const MDL0_MAGIC = 0x304C444D; // "MDL0"
 
-// ─── Sign extension ──────────────────────────────────────────
-
 function sign(value: number, bits: number): number {
   if (value & (1 << (bits - 1))) return value | (-1 << bits);
   return value;
 }
 
-// ─── NDS Dictionary Parser ──────────────────────────────────
-// Uses dictSize field at +0x02 to reliably locate data entries and names
-// at the end of the dict, regardless of tree structure internals.
-
-interface DictResult {
-  offsets: number[];
-  names: string[];
-  dictEnd: number;
-}
-
-function parseDict(r: BinaryReader, entryDataSize: number = 4): DictResult {
-  const dictStart = r.offset;
-  const dummy = r.u8();
-  const count = r.u8();
-  const dictSize = r.u16();
-
-  console.log(`[NSBMD dict] @0x${dictStart.toString(16)}: count=${count}, dictSize=${dictSize}`);
-
-  if (count === 0 || dictSize < 8) {
-    const end = dictStart + Math.max(dictSize, 4);
-    r.seek(end);
-    return { offsets: [], names: [], dictEnd: end };
-  }
-
-  const dictEnd = dictStart + dictSize;
-  const namesStart = dictEnd - count * 16;
-  const dataStart = namesStart - count * entryDataSize;
-
-  if (dataStart < dictStart + 4 || namesStart < dataStart || dictEnd > r.length) {
-    console.warn(`[NSBMD dict] Invalid layout`);
-    r.seek(Math.min(dictEnd, r.length));
-    return { offsets: [], names: [], dictEnd };
-  }
-
-  r.seek(dataStart);
-  const offsets: number[] = [];
-  for (let i = 0; i < count; i++) {
-    offsets.push(r.u32());
-    if (entryDataSize > 4) r.skip(entryDataSize - 4);
-  }
-
-  r.seek(namesStart);
-  const names: string[] = [];
-  for (let i = 0; i < count; i++) {
-    names.push(r.str(16).replace(/\0/g, "").trim());
-  }
-
-  r.seek(dictEnd);
-  console.log(`[NSBMD dict] offsets=[${offsets.map(o => "0x" + o.toString(16)).join(",")}], names=[${names.join(",")}]`);
-
-  return { offsets, names, dictEnd };
+function readNdsString(r: BinaryReader): string {
+  return r.str(16).replace(/\0/g, "").trim();
 }
 
 // ─── Main Parser ─────────────────────────────────────────────
@@ -106,224 +54,131 @@ export function parseNSBMD(buffer: ArrayBuffer): NSBMDFile | null {
   const r = new BinaryReader(buffer);
 
   const magic = r.u32();
-  if (magic !== BMD0_MAGIC) {
-    console.warn(`[NSBMD] Not BMD0 (magic=0x${magic.toString(16)})`);
-    return null;
-  }
+  if (magic !== BMD0_MAGIC) return null;
 
   r.skip(2); // BOM
   r.skip(2); // version
-  const fileSize = r.u32();
-  const headerSize = r.u16();
+  r.u32();   // fileSize
+  r.u16();   // headerSize
   const numBlocks = r.u16();
-
-  console.log(`[NSBMD] BMD0: fileSize=${fileSize}, headerSize=${headerSize}, numBlocks=${numBlocks}, bufferSize=${buffer.byteLength}`);
 
   if (numBlocks === 0) return null;
 
   const blockOffsets: number[] = [];
-  for (let i = 0; i < numBlocks; i++) {
-    blockOffsets.push(r.u32());
-  }
+  for (let i = 0; i < numBlocks; i++) blockOffsets.push(r.u32());
 
-  // Find MDL0 block
   for (const blockOffset of blockOffsets) {
     if (blockOffset + 8 >= buffer.byteLength) continue;
     r.seek(blockOffset);
-    const blockMagic = r.u32();
-    if (blockMagic === MDL0_MAGIC) {
-      console.log(`[NSBMD] Found MDL0 at 0x${blockOffset.toString(16)}`);
-      const blockSize = r.u32();
+    if (r.u32() === MDL0_MAGIC) {
+      r.u32(); // blockSize
       return parseMDL0(r, buffer, blockOffset);
     }
   }
 
-  console.warn("[NSBMD] No valid MDL0 block found");
   return null;
 }
 
 // ─── MDL0 Block Parser ──────────────────────────────────────
-// DSPRE flow:
-//   1. Parse model dict → get modoffset values + model names
-//   2. Read model header SEQUENTIALLY (right after dict)
-//   3. Compute sub-section positions: polyoffset = polyoffset_base + modoffset
 
 function parseMDL0(r: BinaryReader, buffer: ArrayBuffer, blockOffset: number): NSBMDFile {
-  // r is now at blockOffset + 8 (after magic + blockSize)
-  // Parse model dictionary
-  const modelDict = parseDict(r);
+  // Model dictionary
+  r.skip(1); // dummy
+  const num = r.u8(); // model count
+  if (num === 0) return { models: [] };
 
-  if (modelDict.offsets.length === 0) {
-    console.warn("[NSBMD MDL0] No models in dictionary");
-    return { models: [] };
-  }
+  // Skip dictionary tree (DSPRE: 14 + num*4)
+  r.skip(14 + num * 4);
 
-  // Model header is read SEQUENTIALLY from current position (right after dict)
-  // This matches DSPRE's behavior exactly
-  const modelHeaderPos = r.offset;
-  console.log(`[NSBMD MDL0] Model header at 0x${modelHeaderPos.toString(16)}, modoffset=0x${modelDict.offsets[0].toString(16)}`);
+  // Read model offsets and names
+  const modelOffsets: number[] = [];
+  for (let i = 0; i < num; i++) modelOffsets.push(r.u32());
 
-  // For DPPt maps, typically just 1 model
+  const modelNames: string[] = [];
+  for (let i = 0; i < num; i++) modelNames.push(readNdsString(r));
+
+  // Model header (0x38 bytes, read sequentially after dict)
+  const totalsize_base = r.u32();
+  const codeoffset_base = r.u32();
+  const texpaloffset_base = r.u32();
+  const polyoffset_base = r.u32();    // +0x0C
+  const polyend_base = r.u32();
+  r.skip(4);                           // reserved
+  const matnum = r.u8();              // +0x18
+  const polynum = r.u8();             // +0x19
+  r.skip(2);                           // laststack + unknown
+  const modelScaleRaw = r.i32();      // +0x1C
+  const modelScale = modelScaleRaw / 4096;
+  r.skip(0x38 - 0x20);                // skip bounding box etc.
+
+  console.log(`[NSBMD] ${modelNames[0]}: ${polynum} polys, scale=${modelScale.toFixed(2)}`);
+
   const models: NSBMDModel[] = [];
-  for (let i = 0; i < modelDict.offsets.length; i++) {
-    const modoffset = modelDict.offsets[i];
-    const model = parseModelData(r, buffer, modoffset, modelDict.names[i]);
+  for (let i = 0; i < num; i++) {
+    const model = parseModel(r, buffer, modelOffsets[i], polyoffset_base, blockOffset, polynum, modelScale, modelNames[i]);
     if (model) models.push(model);
   }
 
   return { models };
 }
 
-// ─── Model Data Parser ──────────────────────────────────────
-// DSPRE model header layout (0x38 bytes):
-//   +0x00  u32  totalsize_base
-//   +0x04  u32  codeoffset_base
-//   +0x08  u32  texpaloffset_base
-//   +0x0C  u32  polyoffset_base
-//   +0x10  u32  polyend_base
-//   +0x14  u32  (reserved)
-//   +0x18  u8   matnum
-//   +0x19  u8   polynum
-//   +0x1A  u8   laststack
-//   +0x1B  u8   unknown
-//   +0x1C  i32  modelScale (fp /4096)
-//   +0x20  ...  (bounding box, vertex/triangle counts, etc.)
+// ─── Model Parser ────────────────────────────────────────────
 
-function parseModelData(
+function parseModel(
   r: BinaryReader, buffer: ArrayBuffer,
-  modoffset: number, name: string
+  modoffset: number, polyoffset_base: number, blockOffset: number,
+  polynum: number, modelScale: number, name: string
 ): NSBMDModel | null {
-  // Read model header from CURRENT stream position (sequential after dict)
-  // DSPRE does NOT seek to modoffset for the header — it reads sequentially
-  const headerPos = r.offset;
+  if (polynum === 0) return { name, meshes: [], scale: modelScale || 1 };
 
-  const totalsize_base = r.u32();
-  const codeoffset_base = r.u32();
-  const texpaloffset_base = r.u32();
-  const polyoffset_base = r.u32();
-  const polyend_base = r.u32();
-  r.skip(4); // reserved
-  const matnum = r.u8();
-  const polynum = r.u8();
-  r.skip(2); // laststack + unknown
-  const modelScaleRaw = r.i32();
-  const modelScale = modelScaleRaw / 4096;
-  r.skip(0x38 - 0x20); // skip rest of header
+  // Polygon dict location: blockOffset + polyoffset_base + modoffset
+  // Verified: blockOffset = MDL0 position in BMD0 file,
+  //           polyoffset_base = polygon section offset within model,
+  //           modoffset = model data offset within MDL0
+  const polyoffset = blockOffset + polyoffset_base + modoffset;
 
-  // Compute polygon dict absolute position: polyoffset_base + modoffset
-  // This matches DSPRE exactly
-  const polyoffset = polyoffset_base + modoffset;
-
-  console.log(`[NSBMD model] "${name}" @header=0x${headerPos.toString(16)}: polyoffset_base=0x${polyoffset_base.toString(16)}, modoffset=0x${modoffset.toString(16)}, polyoffset=0x${polyoffset.toString(16)}, matnum=${matnum}, polynum=${polynum}, scale=${modelScale.toFixed(4)}`);
-
-  if (polynum === 0) {
+  if (polyoffset + 16 > buffer.byteLength) {
+    console.warn(`[NSBMD] Polygon dict out of bounds: 0x${polyoffset.toString(16)}`);
     return { name, meshes: [], scale: modelScale || 1 };
   }
 
-  if (polyoffset + 4 > buffer.byteLength) {
-    console.warn(`[NSBMD model] Polygon dict out of bounds: 0x${polyoffset.toString(16)}`);
-    return { name, meshes: [], scale: modelScale || 1 };
-  }
-
-  // ─── Parse Polygon Dictionary ───
-  // DSPRE navigates here with: stream.Seek(polyoffset, SeekOrigin.Begin)
+  // Parse polygon dictionary
   r.seek(polyoffset);
+  r.skip(1); // dummy
+  r.u8();    // dict poly count (read but we use polynum from model header)
+  r.skip(14 + polynum * 4); // skip dict tree
 
-  // DSPRE's polygon dict parsing uses HARDCODED skip:
-  //   skip(1) dummy, read byte count, skip(14 + polynum*4), then read offsets
-  // We use dictSize approach for reliability, but let's also try DSPRE's hardcoded way as fallback
-
-  const polyDictStart = r.offset;
-  const polyDict = parseDict(r);
-
-  let polyOffsets: number[];
-  let polyNames: string[];
-
-  if (polyDict.offsets.length > 0) {
-    // dictSize approach worked
-    polyOffsets = polyDict.offsets;
-    polyNames = polyDict.names;
-  } else {
-    // Fallback: try DSPRE's hardcoded skip approach
-    console.log("[NSBMD] Trying DSPRE hardcoded skip approach for polygon dict");
-    r.seek(polyDictStart);
-    r.skip(1); // dummy
-    const pcount = r.u8();
-    if (pcount === 0) return { name, meshes: [], scale: modelScale || 1 };
-    r.skip(14 + pcount * 4);
-
-    polyOffsets = [];
-    for (let j = 0; j < pcount; j++) {
-      polyOffsets.push(r.u32());
-    }
-
-    polyNames = [];
-    for (let j = 0; j < pcount; j++) {
-      polyNames.push(r.str(16).replace(/\0/g, "").trim());
-    }
-    console.log(`[NSBMD] Fallback offsets=[${polyOffsets.map(o => "0x" + o.toString(16)).join(",")}]`);
+  // Read polygon offsets: each becomes absolute via + polyoffset
+  const polyOffsets: number[] = [];
+  for (let j = 0; j < polynum; j++) {
+    polyOffsets.push(r.u32() + polyoffset);
   }
 
-  const numPolys = polyOffsets.length;
-  if (numPolys === 0) {
-    return { name, meshes: [], scale: modelScale || 1 };
+  // Read polygon names
+  for (let j = 0; j < polynum; j++) readNdsString(r);
+
+  // Read polygon headers (16 bytes each, sequentially after names)
+  const polyDataSizes: number[] = [];
+  for (let j = 0; j < polynum; j++) {
+    if (!r.canRead(16)) break;
+    r.i16();  // dummy
+    r.i16();  // headerSize
+    r.i32();  // unknown
+    polyOffsets[j] += r.u32(); // dataOffset added to base → final DL position
+    polyDataSizes.push(r.u32()); // dataSize
   }
 
-  // ─── Polygon offsets: add polyoffset (absolute base) ───
-  // DSPRE: polyOffsets[j] = reader.ReadUInt32() + polyoffset
-  const absPolyOffsets = polyOffsets.map(off => off + polyoffset);
-
-  // ─── Read polygon headers SEQUENTIALLY (right after dict names) ───
-  // Each header: 16 bytes
-  //   +0x00  i16  dummy
-  //   +0x02  i16  headerSize
-  //   +0x04  i32  unknown2
-  //   +0x08  u32  dataOffset (ADDED to absPolyOffsets[j] by DSPRE)
-  //   +0x0C  u32  dataSize
-
-  const headerDataOffsets: number[] = [];
-  const dataSizes: number[] = [];
-
-  for (let j = 0; j < numPolys; j++) {
-    if (!r.canRead(16)) {
-      console.warn(`[NSBMD] Not enough data for poly header ${j} at 0x${r.offset.toString(16)}`);
-      break;
-    }
-    const hdummy = r.i16();
-    const hsize = r.i16();
-    const hunknown = r.i32();
-    const hDataOffset = r.u32(); // DSPRE: polyOffsets[j] += this value
-    const hDataSize = r.u32();
-
-    headerDataOffsets.push(hDataOffset);
-    dataSizes.push(hDataSize);
-
-    console.log(`[NSBMD poly hdr ${j}] dummy=${hdummy}, size=${hsize}, dataOff=0x${hDataOffset.toString(16)}, dataSize=${hDataSize}`);
-  }
-
-  // ─── Decode display lists ───
+  // Decode display lists
   const meshes: NSBMDMesh[] = [];
   const scale = modelScale || 1;
 
-  for (let j = 0; j < numPolys && j < headerDataOffsets.length; j++) {
-    // DSPRE: polyOffsets[j] += headerDataOffset → then seek to polyOffsets[j]
-    const dlAbsOffset = absPolyOffsets[j] + headerDataOffsets[j];
-    const dlSize = dataSizes[j];
+  for (let j = 0; j < polynum && j < polyDataSizes.length; j++) {
+    const dlOffset = polyOffsets[j];
+    const dlSize = polyDataSizes[j];
 
-    console.log(`[NSBMD poly ${j}] dlAbsOffset=0x${dlAbsOffset.toString(16)}, dlSize=${dlSize} (absPolyOff=0x${absPolyOffsets[j].toString(16)} + hdrOff=0x${headerDataOffsets[j].toString(16)})`);
+    if (dlSize === 0 || dlSize > 500000 || dlOffset + dlSize > buffer.byteLength) continue;
 
-    if (dlSize === 0 || dlSize > 500000) {
-      console.warn(`[NSBMD poly ${j}] Invalid DL size: ${dlSize}`);
-      continue;
-    }
-    if (dlAbsOffset + dlSize > buffer.byteLength) {
-      console.warn(`[NSBMD poly ${j}] DL out of bounds: 0x${dlAbsOffset.toString(16)}+${dlSize} > ${buffer.byteLength}`);
-      continue;
-    }
-
-    const displayListData = new Uint8Array(buffer, dlAbsOffset, dlSize);
-    const decoded = decodeDisplayList(displayListData, scale);
-
+    const decoded = decodeDisplayList(new Uint8Array(buffer, dlOffset, dlSize), scale);
     for (const dm of decoded) {
       if (dm.indices.length > 0) {
         meshes.push({
@@ -336,7 +191,7 @@ function parseModelData(
     }
   }
 
-  console.log(`[NSBMD model] "${name}": ${meshes.length} meshes, ${meshes.reduce((s, m) => s + m.positions.length / 3, 0)} total verts`);
+  console.log(`[NSBMD] "${name}": ${meshes.length} meshes, ${meshes.reduce((s, m) => s + m.positions.length / 3, 0)} verts`);
   return { name, meshes, scale };
 }
 
@@ -362,7 +217,6 @@ function decodeDisplayList(data: Uint8Array, scale: number): DecodedPoly[] {
   let batchPositions: number[] = [];
   let batchNormals: number[] = [];
   let batchColors: number[] = [];
-  let totalVerts = 0;
 
   function readU32(): number {
     if (ptr + 4 > data.length) { ptr += 4; return 0; }
@@ -375,7 +229,6 @@ function decodeDisplayList(data: Uint8Array, scale: number): DecodedPoly[] {
     batchPositions.push(vtxX * scale, vtxY * scale, vtxZ * scale);
     batchNormals.push(nrmX, nrmY, nrmZ);
     batchColors.push(colR, colG, colB);
-    totalVerts++;
   }
 
   function flushBatch() {
@@ -430,70 +283,45 @@ function decodeDisplayList(data: Uint8Array, scale: number): DecodedPoly[] {
         }
         case 0x41: { flushBatch(); polyMode = -1; break; }
 
-        case 0x23: { // VTX_16
-          const p1 = readU32(), p2 = readU32();
+        case 0x23: { const p1 = readU32(), p2 = readU32();
           vtxX = sign(p1 & 0xFFFF, 16) / 4096;
           vtxY = sign((p1 >>> 16) & 0xFFFF, 16) / 4096;
           vtxZ = sign(p2 & 0xFFFF, 16) / 4096;
-          emitVertex(); break;
-        }
-        case 0x24: { // VTX_10
-          const p = readU32();
+          emitVertex(); break; }
+        case 0x24: { const p = readU32();
           vtxX = sign(p & 0x3FF, 10) / 64;
           vtxY = sign((p >>> 10) & 0x3FF, 10) / 64;
           vtxZ = sign((p >>> 20) & 0x3FF, 10) / 64;
-          emitVertex(); break;
-        }
-        case 0x25: { // VTX_XY
-          const p = readU32();
+          emitVertex(); break; }
+        case 0x25: { const p = readU32();
           vtxX = sign(p & 0xFFFF, 16) / 4096;
           vtxY = sign((p >>> 16) & 0xFFFF, 16) / 4096;
-          emitVertex(); break;
-        }
-        case 0x26: { // VTX_XZ
-          const p = readU32();
+          emitVertex(); break; }
+        case 0x26: { const p = readU32();
           vtxX = sign(p & 0xFFFF, 16) / 4096;
           vtxZ = sign((p >>> 16) & 0xFFFF, 16) / 4096;
-          emitVertex(); break;
-        }
-        case 0x27: { // VTX_YZ
-          const p = readU32();
+          emitVertex(); break; }
+        case 0x27: { const p = readU32();
           vtxY = sign(p & 0xFFFF, 16) / 4096;
           vtxZ = sign((p >>> 16) & 0xFFFF, 16) / 4096;
-          emitVertex(); break;
-        }
-        case 0x28: { // VTX_DIFF
-          const p = readU32();
+          emitVertex(); break; }
+        case 0x28: { const p = readU32();
           vtxX += sign(p & 0x3FF, 10) / 4096;
           vtxY += sign((p >>> 10) & 0x3FF, 10) / 4096;
           vtxZ += sign((p >>> 20) & 0x3FF, 10) / 4096;
-          emitVertex(); break;
-        }
+          emitVertex(); break; }
 
-        case 0x20: { // COLOR
-          const p = readU32();
-          colR = (p & 0x1F) / 31;
-          colG = ((p >>> 5) & 0x1F) / 31;
-          colB = ((p >>> 10) & 0x1F) / 31;
-          break;
-        }
-        case 0x21: { // NORMAL
-          const p = readU32();
-          nrmX = sign(p & 0x3FF, 10) / 512;
-          nrmY = sign((p >>> 10) & 0x3FF, 10) / 512;
-          nrmZ = sign((p >>> 20) & 0x3FF, 10) / 512;
-          break;
-        }
-        case 0x22: readU32(); break; // TEXCOORD
-        case 0x30: { // DIF_AMB
-          const p = readU32();
-          colR = (p & 0x1F) / 31;
-          colG = ((p >>> 5) & 0x1F) / 31;
-          colB = ((p >>> 10) & 0x1F) / 31;
-          break;
-        }
+        case 0x20: { const p = readU32();
+          colR = (p & 0x1F) / 31; colG = ((p >>> 5) & 0x1F) / 31; colB = ((p >>> 10) & 0x1F) / 31;
+          break; }
+        case 0x21: { const p = readU32();
+          nrmX = sign(p & 0x3FF, 10) / 512; nrmY = sign((p >>> 10) & 0x3FF, 10) / 512; nrmZ = sign((p >>> 20) & 0x3FF, 10) / 512;
+          break; }
+        case 0x22: readU32(); break;
+        case 0x30: { const p = readU32();
+          colR = (p & 0x1F) / 31; colG = ((p >>> 5) & 0x1F) / 31; colB = ((p >>> 10) & 0x1F) / 31;
+          break; }
 
-        // Matrix commands
         case 0x10: readU32(); break;
         case 0x11: readU32(); break;
         case 0x12: readU32(); break;
@@ -508,7 +336,6 @@ function decodeDisplayList(data: Uint8Array, scale: number): DecodedPoly[] {
         case 0x1B: for (let k = 0; k < 3; k++) readU32(); break;
         case 0x1C: for (let k = 0; k < 3; k++) readU32(); break;
 
-        // Other commands with known param counts
         case 0x29: readU32(); break;
         case 0x2A: readU32(); break;
         case 0x2B: readU32(); break;
@@ -528,11 +355,6 @@ function decodeDisplayList(data: Uint8Array, scale: number): DecodedPoly[] {
   }
 
   if (batchPositions.length >= 9) flushBatch();
-
-  if (totalVerts > 0) {
-    console.log(`[NSBMD DL] ${totalVerts} vertices, ${results.length} batches`);
-  }
-
   return results;
 }
 
