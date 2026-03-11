@@ -11,7 +11,8 @@ import { buildHeightmap, PLATE_TYPES } from "../lib/bdhc";
 import type { PermissionGrid, Building, MapData } from "../lib/map-data";
 import { getPermColor, getBuildingWorldPos, rotU16ToDeg } from "../lib/map-data";
 import type { EventData } from "../lib/events";
-import { parseNSBMD, nsbmdToFlatMesh } from "../lib/nsbmd";
+import { parseNSBMD, nsbmdToFlatMesh, type FlatMeshData } from "../lib/nsbmd";
+import type { TEX0Data } from "../lib/nsbtx";
 
 interface Props {
   bdhc: BDHC | null;
@@ -151,16 +152,19 @@ export default function MapView3D({ bdhc, permissions, eventData, showEvents, ma
     const scene = sceneRef.current;
     if (!scene) return;
 
-    // Remove old dynamic meshes
+    // Remove old dynamic meshes (including Groups for buildings)
     const toRemove = scene.children.filter(
       (c) => c.userData.isMapMesh || c.userData.isEventMesh || c.userData.isBuildingMesh
     );
-    toRemove.forEach((c) => {
-      if (c instanceof THREE.Mesh) {
-        c.geometry?.dispose();
-        if (Array.isArray(c.material)) c.material.forEach(m => m.dispose());
-        else c.material?.dispose();
+    const disposeMesh = (obj: THREE.Object3D) => {
+      if (obj instanceof THREE.Mesh) {
+        obj.geometry?.dispose();
+        if (Array.isArray(obj.material)) obj.material.forEach(m => m.dispose());
+        else obj.material?.dispose();
       }
+    };
+    toRemove.forEach((c) => {
+      c.traverse(disposeMesh);
       scene.remove(c);
     });
 
@@ -181,7 +185,7 @@ export default function MapView3D({ bdhc, permissions, eventData, showEvents, ma
         if (nsbmd && nsbmd.models.length > 0) {
           const flat = nsbmdToFlatMesh(nsbmd);
           if (flat && flat.positions.length > 0) {
-            const bounds = buildNSBMDMesh(scene, flat, showWireframe);
+            const bounds = buildNSBMDMesh(scene, flat, showWireframe, nsbmd.textures);
             hasNSBMD = true;
             const triCount = flat.indices.length / 3;
             infoStr += `Model: ${triCount} tris (${(flat.positions.length / 3)} verts)`;
@@ -314,20 +318,101 @@ export default function MapView3D({ bdhc, permissions, eventData, showEvents, ma
 
 function buildNSBMDMesh(
   scene: THREE.Scene,
-  flat: { positions: Float32Array; normals: Float32Array; colors: Float32Array; indices: Uint32Array },
-  wireframe: boolean
+  flat: FlatMeshData,
+  wireframe: boolean,
+  texData: TEX0Data | null
 ): { min: THREE.Vector3; max: THREE.Vector3 } | null {
+  // Normalize UVs from texel space to 0-1 based on texture dimensions
+  const normalizedUvs = new Float32Array(flat.uvs.length);
+  normalizedUvs.set(flat.uvs);
+
+  if (texData) {
+    for (const mt of flat.meshTextures) {
+      const texIdx = texData.textureMap.get(mt.textureName);
+      if (texIdx !== undefined) {
+        const tex = texData.textures[texIdx];
+        // Convert texel coords to normalized UVs
+        // UV data is interleaved: [s0, t0, s1, t1, ...]
+        // We need to find which vertices belong to this mesh's index range
+        // Since indices reference into the shared vertex array, we need
+        // to find the vertex range for this mesh segment
+        const vertStart = mt.indexStart > 0
+          ? Math.min(...Array.from(flat.indices.slice(mt.indexStart, mt.indexStart + mt.indexCount)))
+          : 0;
+        const vertEnd = Math.max(...Array.from(flat.indices.slice(mt.indexStart, mt.indexStart + mt.indexCount))) + 1;
+        for (let v = vertStart; v < vertEnd && v * 2 + 1 < normalizedUvs.length; v++) {
+          normalizedUvs[v * 2] /= tex.width;
+          normalizedUvs[v * 2 + 1] /= tex.height;
+        }
+      }
+    }
+  }
+
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute("position", new THREE.BufferAttribute(flat.positions, 3));
   geometry.setAttribute("normal", new THREE.BufferAttribute(flat.normals, 3));
   geometry.setAttribute("color", new THREE.BufferAttribute(flat.colors, 3));
+  geometry.setAttribute("uv", new THREE.BufferAttribute(normalizedUvs, 2));
   geometry.setIndex(new THREE.BufferAttribute(flat.indices, 1));
   geometry.computeVertexNormals();
   geometry.computeBoundingBox();
 
-  const material = wireframe
-    ? new THREE.MeshBasicMaterial({ vertexColors: true, wireframe: true })
-    : new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide });
+  // Build Three.js textures from TEX0 data
+  const threeTextures = new Map<string, THREE.Texture>();
+  if (texData) {
+    for (const tex of texData.textures) {
+      // Copy to a fresh ArrayBuffer to satisfy TypeScript's strict typing
+      const rgbaCopy = new Uint8Array(tex.rgba.length);
+      rgbaCopy.set(tex.rgba);
+      const dataTex = new THREE.DataTexture(
+        rgbaCopy, tex.width, tex.height, THREE.RGBAFormat
+      );
+      dataTex.needsUpdate = true;
+      dataTex.magFilter = THREE.NearestFilter;
+      dataTex.minFilter = THREE.NearestFilter;
+      dataTex.wrapS = THREE.RepeatWrapping;
+      dataTex.wrapT = THREE.RepeatWrapping;
+      // NDS textures are stored top-to-bottom, Three.js expects bottom-to-top
+      dataTex.flipY = true;
+      threeTextures.set(tex.name, dataTex);
+    }
+    console.log(`[3D] Created ${threeTextures.size} Three.js textures`);
+  }
+
+  // Create materials per mesh group
+  const materials: THREE.Material[] = [];
+  let groupIndex = 0;
+
+  if (!wireframe && flat.meshTextures.length > 0 && threeTextures.size > 0) {
+    // Group geometry by texture for multi-material rendering
+    for (const mt of flat.meshTextures) {
+      const tex = threeTextures.get(mt.textureName);
+      if (tex) {
+        materials.push(new THREE.MeshLambertMaterial({
+          map: tex,
+          vertexColors: true,
+          side: THREE.DoubleSide,
+          transparent: true,
+          alphaTest: 0.1,
+        }));
+      } else {
+        materials.push(new THREE.MeshLambertMaterial({
+          vertexColors: true,
+          side: THREE.DoubleSide,
+        }));
+      }
+      geometry.addGroup(mt.indexStart, mt.indexCount, groupIndex++);
+    }
+  }
+
+  let material: THREE.Material | THREE.Material[];
+  if (wireframe) {
+    material = new THREE.MeshBasicMaterial({ vertexColors: true, wireframe: true });
+  } else if (materials.length > 0) {
+    material = materials;
+  } else {
+    material = new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide });
+  }
 
   const mesh = new THREE.Mesh(geometry, material);
   mesh.receiveShadow = true;
@@ -353,49 +438,41 @@ function buildNSBMDMesh(
 
 // ─── Building markers ────────────────────────────────────────
 
-function buildBuildingMarkers(scene: THREE.Scene, buildings: Building[], tileSize: number) {
-  const geometry = new THREE.BoxGeometry(12, 24, 12);
+function buildBuildingMarkers(scene: THREE.Scene, buildings: Building[], _tileSize: number) {
+  // Shared geometry & materials — small pin markers (not to-scale boxes)
+  const pinGeo = new THREE.CylinderGeometry(2, 2, 1, 6);
+  const headGeo = new THREE.SphereGeometry(4, 8, 6);
+  const pinMat = new THREE.MeshLambertMaterial({ color: 0x9966cc, transparent: true, opacity: 0.85 });
+  const headMat = new THREE.MeshLambertMaterial({ color: 0xcc88ff, transparent: true, opacity: 0.85 });
 
   for (const b of buildings) {
     const pos = getBuildingWorldPos(b);
-    // Convert from NDS coordinates to our scene coordinates
-    // NDS: X=right, Y=up-ish (actually depth in map), Z=height
-    // In DSPRE, X and Z are horizontal, Y is vertical
-    const material = new THREE.MeshLambertMaterial({
-      color: 0x8866aa,
-      transparent: true,
-      opacity: 0.7,
-    });
+    // Building positions are in NDS world coordinates (same space as model).
+    // NSBMD mesh has scale.set(1,1,-1) for Z-flip, so building markers
+    // need the same flip: scene X = pos.x, scene Y = pos.y (height), scene Z = -pos.z
+    const group = new THREE.Group();
+    group.position.set(pos.x, pos.y, -pos.z);
 
-    const mesh = new THREE.Mesh(geometry, material);
-    // Position: xPosition is in tile-relative units, multiply by tileSize
-    mesh.position.set(
-      pos.x * tileSize,
-      pos.z * tileSize,  // Z is height in NDS coordinates
-      pos.y * tileSize   // Y is depth in NDS coordinates
-    );
+    // Pin body
+    const pin = new THREE.Mesh(pinGeo, pinMat);
+    pin.scale.set(1, 12, 1);
+    pin.position.y = 6;
+    group.add(pin);
 
-    // Apply rotation
+    // Pin head
+    const head = new THREE.Mesh(headGeo, headMat);
+    head.position.y = 14;
+    group.add(head);
+
+    // Rotation
     if (b.yRotation !== 0) {
-      mesh.rotation.y = (rotU16ToDeg(b.yRotation) * Math.PI) / 180;
+      group.rotation.y = (rotU16ToDeg(b.yRotation) * Math.PI) / 180;
     }
 
-    // Scale based on width/height/length (default 16)
-    const sx = (b.width || 16) / 16;
-    const sy = (b.height || 16) / 16;
-    const sz = (b.length || 16) / 16;
-    mesh.scale.set(sx * 12, sy * 24, sz * 12);
+    group.userData.isBuildingMesh = true;
+    scene.add(group);
 
-    mesh.castShadow = true;
-    mesh.userData.isBuildingMesh = true;
-
-    // Add wireframe outline
-    const wireGeo = new THREE.EdgesGeometry(geometry);
-    const wireMat = new THREE.LineBasicMaterial({ color: 0xaa88cc });
-    const wire = new THREE.LineSegments(wireGeo, wireMat);
-    mesh.add(wire);
-
-    scene.add(mesh);
+    console.log(`[3D] Building #${b.modelId}: pos=(${pos.x.toFixed(1)}, ${pos.y.toFixed(1)}, ${pos.z.toFixed(1)}), w/h/l=${b.width}/${b.height}/${b.length}`);
   }
 }
 
