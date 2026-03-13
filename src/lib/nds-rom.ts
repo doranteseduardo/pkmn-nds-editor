@@ -442,9 +442,9 @@ export function getGamePaths(version: GameInfo["version"]) {
         : "fielddata/encountdata/pl_enc_data.narc",
     /** Map texture NARC — NSBTX files indexed by area_data's map_tex_set ID */
     mapTex: "fielddata/areadata/area_map_tex/map_tex_set.narc",
-    /** Area data NARC — maps zone headers to texture set indices */
-    areaData: isDPt
-      ? "fielddata/areadata/area_data.narc"
-      : "fielddata/areadata/area_data_release.narc",
+    /** Building texture NARC — NSBTX files indexed by area_data's buildingsTileset ID */
+    buildingTex: "fielddata/areadata/area_build_model/areabm_texset.narc",
+    /** Area data NARC — maps zone headers to texture set indices (same path for DP and Pt) */
+    areaData: "fielddata/areadata/area_data.narc",
   };
 }

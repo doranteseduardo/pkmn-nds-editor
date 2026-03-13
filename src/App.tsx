@@ -56,10 +56,13 @@ export default function App() {
   const [matrixNarc, setMatrixNarc] = useState<NARC | null>(null);
   const [encounterNarc, setEncounterNarc] = useState<NARC | null>(null);
   const [mapTexNarc, setMapTexNarc] = useState<NARC | null>(null);
+  const [buildingTexNarc, setBuildingTexNarc] = useState<NARC | null>(null);
   const [areaDataNarc, setAreaDataNarc] = useState<NARC | null>(null);
 
   /** Raw NSBTX texture data for the currently loaded map */
   const [mapTexData, setMapTexData] = useState<ArrayBuffer | null>(null);
+  /** Raw NSBTX texture data from building tileset (supplementary textures) */
+  const [buildingTexData, setBuildingTexData] = useState<ArrayBuffer | null>(null);
 
   // Current map
   const [currentMapIdx, setCurrentMapIdx] = useState<number | null>(null);
@@ -120,6 +123,7 @@ export default function App() {
       const matrix = tryExtractNarc(paths.mapMatrix);
       const encounters = tryExtractNarc(paths.encounterData);
       const mapTex = tryExtractNarc(paths.mapTex);
+      const buildingTex = tryExtractNarc(paths.buildingTex);
       const areaData = tryExtractNarc(paths.areaData);
 
       setLandNarc(land);
@@ -127,6 +131,7 @@ export default function App() {
       setMatrixNarc(matrix);
       setEncounterNarc(encounters);
       setMapTexNarc(mapTex);
+      setBuildingTexNarc(buildingTex);
       setAreaDataNarc(areaData);
       // Log ARM9 info and dump first header bytes to verify table location
       console.log(`[ROM] Game code: ${parsed.gameCode}, ARM9 offset: 0x${parsed.arm9Offset.toString(16)}, ARM9 size: 0x${parsed.arm9Size.toString(16)}`);
@@ -152,6 +157,7 @@ export default function App() {
       }
 
       if (mapTex) console.log(`[ROM] Map texture NARC: ${mapTex.fileCount} texture sets`);
+      if (buildingTex) console.log(`[ROM] Building texture NARC: ${buildingTex.fileCount} texture sets`);
       if (areaData) {
         // Dump first few entries to understand format
         const sizes = new Set<number>();
@@ -178,7 +184,7 @@ export default function App() {
       if (matrix?.files[0]) setMatrixData(parseMapMatrix(matrix.files[0].data));
 
       if (land && land.fileCount > 0) {
-        loadMapInternal(0, land, events, encounters, mapTex, areaData, parsed);
+        loadMapInternal(0, land, events, encounters, mapTex, buildingTex, areaData, parsed);
       }
     } catch (err) {
       addToast(`Error: ${(err as Error).message}`, "error");
@@ -190,7 +196,7 @@ export default function App() {
   // ─── Load map ──────────────────────────────────
   const loadMapInternal = useCallback(
     (idx: number, ln: NARC | null, en: NARC | null, ec: NARC | null,
-     mt: NARC | null = null, ad: NARC | null = null, romRef: NDSRom | null = null) => {
+     mt: NARC | null = null, bt: NARC | null = null, ad: NARC | null = null, romRef: NDSRom | null = null) => {
       if (!ln || idx >= ln.fileCount) return;
       const md = modifiedMaps[idx]
         ? parseMapData(modifiedMaps[idx])
@@ -222,6 +228,7 @@ export default function App() {
       // Step 2: Use areaDataID to index into area_data NARC → get mapTileset
       // Step 3: Use mapTileset to index into map_tex NARC
       let texSetIdx = 0; // fallback
+      let bldTexSetIdx = -1; // building tileset index (-1 = none)
       let areaDataID: number | null = null;
 
       if (romRef) {
@@ -243,8 +250,9 @@ export default function App() {
           console.log(`[ROM] AreaData[${areaDataID}]: buildingsTileset=${buildingsTileset}, mapTileset=${mapTileset}`);
           if (mt && mapTileset < mt.fileCount) {
             texSetIdx = mapTileset;
-          } else if (mt && buildingsTileset < mt.fileCount) {
-            texSetIdx = buildingsTileset;
+          }
+          if (bt && buildingsTileset < bt.fileCount) {
+            bldTexSetIdx = buildingsTileset;
           }
         }
       } else {
@@ -268,6 +276,14 @@ export default function App() {
         setMapTexData(null);
       }
 
+      // Load building tileset NSBTX as supplementary texture source
+      if (bt && bldTexSetIdx >= 0 && bldTexSetIdx < bt.fileCount && bt.files[bldTexSetIdx].data.byteLength > 16) {
+        setBuildingTexData(bt.files[bldTexSetIdx].data);
+        console.log(`[ROM] Loaded building texture set #${bldTexSetIdx}: ${bt.files[bldTexSetIdx].data.byteLength} bytes`);
+      } else {
+        setBuildingTexData(null);
+      }
+
       setCurrentMapIdx(idx);
       setSelectedEvent(null);
     },
@@ -275,8 +291,8 @@ export default function App() {
   );
 
   const loadMap = useCallback(
-    (idx: number) => loadMapInternal(idx, landNarc, eventNarc, encounterNarc, mapTexNarc, areaDataNarc, rom),
-    [landNarc, eventNarc, encounterNarc, mapTexNarc, areaDataNarc, rom, loadMapInternal]
+    (idx: number) => loadMapInternal(idx, landNarc, eventNarc, encounterNarc, mapTexNarc, buildingTexNarc, areaDataNarc, rom),
+    [landNarc, eventNarc, encounterNarc, mapTexNarc, buildingTexNarc, areaDataNarc, rom, loadMapInternal]
   );
 
   // ─── Permission editing ────────────────────────
@@ -536,6 +552,7 @@ export default function App() {
                     showEvents={showLayers.events}
                     mapData={mapData}
                     mapTexData={mapTexData}
+                    buildingTexData={buildingTexData}
                   />
                 )}
                 <RightPanel

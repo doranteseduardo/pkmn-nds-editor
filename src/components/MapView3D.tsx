@@ -24,6 +24,8 @@ interface Props {
   mapData: MapData | null;
   /** Raw NSBTX texture data from the ROM's map_tex NARC */
   mapTexData: ArrayBuffer | null;
+  /** Raw NSBTX texture data from the ROM's building tileset NARC (supplementary) */
+  buildingTexData: ArrayBuffer | null;
 }
 
 // ─── Plate type colors ──────────────────────────────────────
@@ -40,7 +42,7 @@ const PLATE_COLORS: Record<number, number> = {
 
 // ─── Component ───────────────────────────────────────────────
 
-export default function MapView3D({ bdhc, permissions, eventData, showEvents, mapData, mapTexData }: Props) {
+export default function MapView3D({ bdhc, permissions, eventData, showEvents, mapData, mapTexData, buildingTexData }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
   const sceneRef = useRef<THREE.Scene | null>(null);
@@ -202,6 +204,55 @@ export default function MapView3D({ bdhc, permissions, eventData, showEvents, ma
               }
             }
 
+            // ─── Try loading building tileset as supplementary texture source ───
+            // The building tileset NSBTX may contain textures referenced by the map model
+            // that aren't in the main map tileset (goes beyond DSPRE's single-NSBTX approach)
+            let buildingRawTexData: TEX0RawData | null = null;
+            if (buildingTexData && buildingTexData.byteLength > 16) {
+              try {
+                const br = new BinaryReader(buildingTexData);
+                const bMagic = br.u32();
+                if (bMagic === 0x30585442) { // "BTX0"
+                  br.skip(2 + 2 + 4 + 2);
+                  const bNumBlks = br.u16();
+                  for (let bi = 0; bi < bNumBlks; bi++) {
+                    const bBlkOff = br.u32();
+                    const bSavedPos = br.offset;
+                    buildingRawTexData = parseTEX0(buildingTexData, bBlkOff);
+                    br.seek(bSavedPos);
+                    if (buildingRawTexData && buildingRawTexData.textures.length > 0) break;
+                  }
+                } else {
+                  buildingRawTexData = parseTEX0(buildingTexData, 0);
+                }
+                if (buildingRawTexData) {
+                  console.log(`[3D] Loaded building NSBTX: ${buildingRawTexData.textures.length} textures, ${buildingRawTexData.palettes.length} palettes`);
+                }
+              } catch (e) {
+                console.warn("[3D] Building NSBTX parse error:", e);
+              }
+            }
+
+            // ─── Merge texture data from map tileset + building tileset ───
+            // Building tileset textures are appended as fallbacks (map tileset takes priority)
+            let mergedTexData = rawTexData;
+            if (rawTexData && buildingRawTexData) {
+              const mapTexNames = new Set(rawTexData.textures.map(t => t.texname));
+              const mapPalNames = new Set(rawTexData.palettes.map(p => p.palname));
+              const extraTex = buildingRawTexData.textures.filter(t => !mapTexNames.has(t.texname));
+              const extraPal = buildingRawTexData.palettes.filter(p => !mapPalNames.has(p.palname));
+              if (extraTex.length > 0 || extraPal.length > 0) {
+                mergedTexData = {
+                  textures: [...rawTexData.textures, ...extraTex],
+                  palettes: [...rawTexData.palettes, ...extraPal],
+                };
+                console.log(`[3D] Merged: +${extraTex.length} textures, +${extraPal.length} palettes from building tileset`);
+              }
+            } else if (!rawTexData && buildingRawTexData) {
+              mergedTexData = buildingRawTexData;
+              console.log("[3D] Using building NSBTX as sole texture source");
+            }
+
             // ─── DSPRE MatchTextures + MakeTexture pipeline ───
             // Per-material matching: each mesh group provides its own texName+palName pair
             // from the MDL0 polygon→matId→texDef/palDef chain (faithful to DSPRE)
@@ -210,7 +261,7 @@ export default function MapView3D({ bdhc, permissions, eventData, showEvents, ma
               paletteName: mt.paletteName,
               matId: mt.matId,
             }));
-            const decodedTextures = matchAndDecodeTextures(rawTexData, meshTextureInfo, texPalMap);
+            const decodedTextures = matchAndDecodeTextures(mergedTexData, meshTextureInfo, texPalMap);
             setDebugTextures(decodedTextures);
             const bounds = buildNSBMDMesh(scene, flat, showWireframe, decodedTextures);
             hasNSBMD = true;
@@ -266,7 +317,7 @@ export default function MapView3D({ bdhc, permissions, eventData, showEvents, ma
     }
 
     setInfo(infoStr || "No data");
-  }, [bdhc, permissions, eventData, showEvents, mapData, mapTexData, showModel, showWireframe]);
+  }, [bdhc, permissions, eventData, showEvents, mapData, mapTexData, buildingTexData, showModel, showWireframe]);
 
   // ─── Mouse handlers ─────────────────────────────
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
@@ -369,6 +420,41 @@ export default function MapView3D({ bdhc, permissions, eventData, showEvents, ma
 // KEY INSIGHT: The same texture name may need DIFFERENT palettes for different materials.
 // So we decode per-material (texName+palName pair), not per-texture-name.
 
+// ─── Dynamic Texture Placeholders ─────────────────────────────
+// The NDS game engine loads certain textures into VRAM at runtime
+// (snow, water, shadows, grass, etc.). These don't exist in any
+// static NSBTX file. We generate colored placeholders so the map
+// doesn't have blank holes where these textures should be.
+
+function getDynamicTexturePlaceholder(texName: string): NdsTexture | null {
+  // Map texture name patterns to RGBA colors
+  const patterns: [RegExp, [number, number, number, number]][] = [
+    [/^s_snow/i,    [230, 240, 255, 200]], // Snow — light blue-white, semi-transparent
+    [/^s_sonw/i,    [230, 240, 255, 200]], // Snow variant (typo in ROM data)
+    [/^lake/i,      [ 40, 100, 180, 160]], // Lake water — blue, semi-transparent
+    [/^puddle/i,    [ 80, 130, 200, 120]], // Puddle — lighter blue, more transparent
+    [/^tshadow/i,   [ 20,  20,  20,  80]], // Tree shadow — dark, very transparent
+    [/^hage/i,      [ 80, 140,  60, 200]], // Grass/undergrowth — green
+    [/^tree/i,      [ 50, 120,  50, 220]], // Tree texture — darker green
+    [/^shadow/i,    [ 20,  20,  20,  80]], // Generic shadow
+  ];
+
+  for (const [pattern, color] of patterns) {
+    if (pattern.test(texName)) {
+      const size = 8; // Small placeholder texture
+      const rgba = new Uint8Array(size * size * 4);
+      for (let i = 0; i < size * size; i++) {
+        rgba[i * 4] = color[0];
+        rgba[i * 4 + 1] = color[1];
+        rgba[i * 4 + 2] = color[2];
+        rgba[i * 4 + 3] = color[3];
+      }
+      return { name: texName, width: size, height: size, format: -1, rgba };
+    }
+  }
+  return null;
+}
+
 interface DecodedMaterialTexture extends NdsTexture {
   /** Unique key: "texName|palName" — different materials sharing a texture name
    *  but with different palettes get separate decoded textures */
@@ -409,7 +495,20 @@ function matchAndDecodeTextures(
         }
       }
     }
-    if (!rawTex) continue; // No matching texture in NSBTX
+    if (!rawTex) {
+      // Generate a smart placeholder for known dynamic texture types
+      // These are runtime textures the NDS loads into VRAM (not in any static NSBTX)
+      const placeholder = getDynamicTexturePlaceholder(mt.textureName);
+      if (placeholder) {
+        const materialKey = `${mt.textureName}|${mt.paletteName}`;
+        if (!decodedKeys.has(materialKey)) {
+          decodedKeys.add(materialKey);
+          decoded.push({ ...placeholder, materialKey });
+          console.log(`[MatchTex] Using placeholder for dynamic texture "${mt.textureName}"`);
+        }
+      }
+      continue;
+    }
 
     // Step 2: Find raw palette — DSPRE approach: per-polygon via palmatid → name → NSBTX
     let palName = mt.paletteName; // From polygon's matId → palDef mapping
