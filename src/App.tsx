@@ -128,12 +128,27 @@ export default function App() {
       setEncounterNarc(encounters);
       setMapTexNarc(mapTex);
       setAreaDataNarc(areaData);
-      // Log ARM9 info for header table lookup
+      // Log ARM9 info and dump first header bytes to verify table location
       console.log(`[ROM] Game code: ${parsed.gameCode}, ARM9 offset: 0x${parsed.arm9Offset.toString(16)}, ARM9 size: 0x${parsed.arm9Size.toString(16)}`);
-      // Test first few map header lookups
-      for (let i = 0; i < Math.min(5, land?.fileCount ?? 0); i++) {
-        const areaId = getAreaDataIdFromArm9(parsed.buffer, parsed.arm9Offset, parsed.arm9Size, parsed.gameCode, i);
-        console.log(`[ROM] Map header[${i}] → areaDataID=${areaId}`);
+      {
+        // Dump first 3 map header raw bytes (24 bytes each) for verification
+        const dv = new DataView(parsed.buffer);
+        for (let i = 0; i < Math.min(5, land?.fileCount ?? 0); i++) {
+          const areaId = getAreaDataIdFromArm9(parsed.buffer, parsed.arm9Offset, parsed.arm9Size, parsed.gameCode, i);
+          // Also dump raw header bytes for verification
+          const HEADER_OFFSETS: Record<string, number> = { CPUS: 0xE60B0, CPUE: 0xE601C, ADAE: 0xEEDBC, APAE: 0xEEDBC };
+          const tableOff = HEADER_OFFSETS[parsed.gameCode];
+          if (tableOff !== undefined) {
+            const absOff = parsed.arm9Offset + tableOff + 24 * i;
+            if (absOff + 24 <= parsed.buffer.byteLength) {
+              const bytes: string[] = [];
+              for (let b = 0; b < 24; b++) bytes.push(dv.getUint8(absOff + b).toString(16).padStart(2, "0"));
+              const matrixNum = dv.getUint16(absOff + 2, true);
+              const scriptNum = dv.getUint16(absOff + 4, true);
+              console.log(`[ROM] Header[${i}]: areaDataID=${areaId}, matrix=${matrixNum}, script=${scriptNum}, raw=[${bytes.join(" ")}]`);
+            }
+          }
+        }
       }
 
       if (mapTex) console.log(`[ROM] Map texture NARC: ${mapTex.fileCount} texture sets`);

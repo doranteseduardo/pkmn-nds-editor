@@ -11,9 +11,10 @@ import { buildHeightmap, PLATE_TYPES } from "../lib/bdhc";
 import type { PermissionGrid, Building, MapData } from "../lib/map-data";
 import { getPermColor, getBuildingWorldPos, rotU16ToDeg } from "../lib/map-data";
 import type { EventData } from "../lib/events";
-import { parseNSBMD, nsbmdToFlatMesh, type FlatMeshData } from "../lib/nsbmd";
-import { parseTEX0, type TEX0Data } from "../lib/nsbtx";
+import { parseNSBMD, nsbmdToFlatMesh, type FlatMeshData, type MaterialUVProps } from "../lib/nsbmd";
+import { parseTEX0, makeTexture, type TEX0RawData, type RawNdsTexture, type RawNdsPalette, type NdsTexture } from "../lib/nsbtx";
 import { BinaryReader } from "../lib/binary";
+import TextureDebugPanel from "./TextureDebugPanel";
 
 interface Props {
   bdhc: BDHC | null;
@@ -48,6 +49,8 @@ export default function MapView3D({ bdhc, permissions, eventData, showEvents, ma
   const [info, setInfo] = useState("Initializing 3D view…");
   const [showModel, setShowModel] = useState(true);
   const [showWireframe, setShowWireframe] = useState(false);
+  const [showTexDebug, setShowTexDebug] = useState(false);
+  const [debugTextures, setDebugTextures] = useState<NdsTexture[]>([]);
 
   // Camera orbit state
   const orbitRef = useRef({
@@ -170,37 +173,46 @@ export default function MapView3D({ bdhc, permissions, eventData, showEvents, ma
         if (nsbmd && nsbmd.models.length > 0) {
           const flat = nsbmdToFlatMesh(nsbmd);
           if (flat && flat.positions.length > 0) {
-            // Use embedded TEX0 from BMD0 if available, otherwise try external NSBTX
-            let textures = nsbmd.textures;
-            if (!textures && mapTexData && mapTexData.byteLength > 16) {
+            // Get raw TEX0 data — embedded or external NSBTX
+            let rawTexData = nsbmd.texData;
+            const texPalMap = nsbmd.texturePaletteMap;
+
+            if (!rawTexData && mapTexData && mapTexData.byteLength > 16) {
               try {
-                // NSBTX files are BTX0 containers — same structure as BMD0:
-                // magic(4) + BOM(2) + ver(2) + size(4) + headerSize(2) + numBlocks(2) + blockOffsets
                 const r = new BinaryReader(mapTexData);
                 const magic = r.u32();
-                // BTX0 magic = 0x30585442 ("BTX0") or sometimes raw TEX0
                 if (magic === 0x30585442) { // "BTX0"
-                  r.skip(2 + 2 + 4 + 2); // BOM, ver, size, headerSize
+                  r.skip(2 + 2 + 4 + 2);
                   const numBlks = r.u16();
                   for (let bi = 0; bi < numBlks; bi++) {
                     const blkOff = r.u32();
                     const savedPos = r.offset;
-                    textures = parseTEX0(mapTexData, blkOff);
+                    rawTexData = parseTEX0(mapTexData, blkOff);
                     r.seek(savedPos);
-                    if (textures && textures.textures.length > 0) break;
+                    if (rawTexData && rawTexData.textures.length > 0) break;
                   }
                 } else {
-                  // Maybe raw TEX0 block
-                  textures = parseTEX0(mapTexData, 0);
+                  rawTexData = parseTEX0(mapTexData, 0);
                 }
-                if (textures) {
-                  console.log(`[3D] Loaded external NSBTX: ${textures.textures.length} textures`);
+                if (rawTexData) {
+                  console.log(`[3D] Loaded external NSBTX: ${rawTexData.textures.length} textures, ${rawTexData.palettes.length} palettes`);
                 }
               } catch (e) {
                 console.warn("[3D] External NSBTX parse error:", e);
               }
             }
-            const bounds = buildNSBMDMesh(scene, flat, showWireframe, textures);
+
+            // ─── DSPRE MatchTextures + MakeTexture pipeline ───
+            // Per-material matching: each mesh group provides its own texName+palName pair
+            // from the MDL0 polygon→matId→texDef/palDef chain (faithful to DSPRE)
+            const meshTextureInfo = flat.meshTextures.map(mt => ({
+              textureName: mt.textureName,
+              paletteName: mt.paletteName,
+              matId: mt.matId,
+            }));
+            const decodedTextures = matchAndDecodeTextures(rawTexData, meshTextureInfo, texPalMap);
+            setDebugTextures(decodedTextures);
+            const bounds = buildNSBMDMesh(scene, flat, showWireframe, decodedTextures);
             hasNSBMD = true;
             const triCount = flat.indices.length / 3;
             infoStr += `Model: ${triCount} tris (${(flat.positions.length / 3)} verts)`;
@@ -324,9 +336,183 @@ export default function MapView3D({ bdhc, permissions, eventData, showEvents, ma
         >
           Wire
         </button>
+        {debugTextures.length > 0 && (
+          <button
+            className={`tool-btn ${showTexDebug ? "active" : ""}`}
+            onClick={() => setShowTexDebug(v => !v)}
+            style={{ fontSize: 11, padding: "2px 8px" }}
+          >
+            Tex
+          </button>
+        )}
       </div>
+      <TextureDebugPanel
+        textures={debugTextures}
+        visible={showTexDebug}
+        onClose={() => setShowTexDebug(false)}
+      />
     </div>
   );
+}
+
+// ─── DSPRE MatchTextures + MakeTexture Pipeline ──────────────
+// Faithful reimplementation of DSPRE's NSBMD.MatchTextures() (lines 50-102):
+//
+// For each polygon:
+//   1. Get polygon's MatId from code section
+//   2. Find model texture def whose texmatid list contains MatId → get texture NAME
+//   3. Look up texture NAME in external NSBTX texture list → get raw texture data
+//   4. Find model palette def whose palmatid list contains MatId → get palette NAME
+//   5. Look up palette NAME in external NSBTX palette list → get raw palette data
+//   6. Decode raw texture + raw palette → RGBA image (MakeTexture)
+//
+// KEY INSIGHT: The same texture name may need DIFFERENT palettes for different materials.
+// So we decode per-material (texName+palName pair), not per-texture-name.
+
+interface DecodedMaterialTexture extends NdsTexture {
+  /** Unique key: "texName|palName" — different materials sharing a texture name
+   *  but with different palettes get separate decoded textures */
+  materialKey: string;
+}
+
+function matchAndDecodeTextures(
+  rawTexData: TEX0RawData | null,
+  meshTextures: { textureName: string; paletteName: string; matId: number }[],
+  texPalMap: Map<string, string>
+): DecodedMaterialTexture[] {
+  if (!rawTexData) return [];
+
+  const { textures: rawTextures, palettes: rawPalettes } = rawTexData;
+  const decoded: DecodedMaterialTexture[] = [];
+  const decodedKeys = new Set<string>();
+
+  // Build quick lookup maps
+  const texByName = new Map<string, RawNdsTexture>();
+  for (const t of rawTextures) texByName.set(t.texname, t);
+  const palByName = new Map<string, RawNdsPalette>();
+  for (const p of rawPalettes) palByName.set(p.palname, p);
+
+  console.log(`[MatchTex] DSPRE-style matching: ${rawTextures.length} textures, ${rawPalettes.length} palettes, ${meshTextures.length} mesh groups, ${texPalMap.size} MDL0 mappings`);
+
+  // For each mesh group (polygon), decode its specific texture+palette pair
+  for (const mt of meshTextures) {
+    if (!mt.textureName) continue;
+
+    // Step 1: Find raw texture by name in NSBTX
+    let rawTex = texByName.get(mt.textureName);
+    if (!rawTex) {
+      // Try prefix matching (DSPRE falls back to index-based, we try prefix)
+      for (const [tname, t] of texByName) {
+        if (mt.textureName.startsWith(tname) || tname.startsWith(mt.textureName)) {
+          rawTex = t;
+          break;
+        }
+      }
+    }
+    if (!rawTex) continue; // No matching texture in NSBTX
+
+    // Step 2: Find raw palette — DSPRE approach: per-polygon via palmatid → name → NSBTX
+    let palName = mt.paletteName; // From polygon's matId → palDef mapping
+    let matchMethod = "";
+
+    // Priority 1: Direct palette name from MDL0 palDef (polygon→matId→palDef→name)
+    if (palName) {
+      matchMethod = `mdl0-paldef "${palName}"`;
+    }
+
+    // Priority 2: texturePaletteMap (texture name → palette name from MDL0)
+    if (!palName) {
+      palName = texPalMap.get(rawTex.texname) ?? "";
+      if (palName) matchMethod = `mdl0-texpalmap "${palName}"`;
+    }
+
+    // Priority 3: Exact name match in NSBTX palettes
+    if (!palName) {
+      const exactPal = palByName.get(rawTex.texname);
+      if (exactPal) { palName = exactPal.palname; matchMethod = "exact-name"; }
+    }
+
+    // Priority 4: Prefix matching
+    if (!palName) {
+      let bestLen = 0;
+      for (const p of rawPalettes) {
+        if (rawTex.texname.startsWith(p.palname) && p.palname.length > bestLen) {
+          palName = p.palname;
+          bestLen = p.palname.length;
+          matchMethod = `prefix "${p.palname}"`;
+        }
+        if (p.palname.startsWith(rawTex.texname) && rawTex.texname.length > bestLen) {
+          palName = p.palname;
+          bestLen = rawTex.texname.length;
+          matchMethod = `prefix "${p.palname}"`;
+        }
+      }
+    }
+
+    // Priority 5: Fallback to first palette
+    if (!palName && rawPalettes.length > 0 && rawTex.format !== 7) {
+      palName = rawPalettes[0].palname;
+      matchMethod = `fallback "${palName}"`;
+    }
+
+    // Build unique key for this texture+palette combination
+    const materialKey = `${rawTex.texname}|${palName}`;
+
+    // Skip if already decoded this exact combination
+    if (decodedKeys.has(materialKey)) continue;
+    decodedKeys.add(materialKey);
+
+    const matchedPal = palName ? (palByName.get(palName) ?? null) : null;
+    console.log(`[MatchTex] "${rawTex.texname}" fmt=${rawTex.format} ${rawTex.width}x${rawTex.height} + pal=${matchMethod || "none"} → key="${materialKey}"`);
+
+    // Step 3: Decode texture using matched palette (DSPRE MakeTexture)
+    const rgba = makeTexture(rawTex, matchedPal);
+    if (rgba) {
+      decoded.push({
+        name: rawTex.texname,
+        width: rawTex.width,
+        height: rawTex.height,
+        format: rawTex.format,
+        rgba,
+        materialKey,
+      });
+    } else {
+      console.warn(`[MatchTex] Failed to decode "${rawTex.texname}"`);
+    }
+  }
+
+  // Also decode any NSBTX textures not referenced by mesh groups
+  // (for debug panel and completeness)
+  for (const rawTex of rawTextures) {
+    const fallbackKey = `${rawTex.texname}|`;
+    if (decodedKeys.has(fallbackKey)) continue;
+
+    // Check if this texture was already decoded with some palette
+    let alreadyDecoded = false;
+    for (const key of decodedKeys) {
+      if (key.startsWith(rawTex.texname + "|")) { alreadyDecoded = true; break; }
+    }
+    if (alreadyDecoded) continue;
+
+    // Decode with best-guess palette for debug
+    let pal: RawNdsPalette | null = null;
+    const palNameFromMap = texPalMap.get(rawTex.texname);
+    if (palNameFromMap) pal = palByName.get(palNameFromMap) ?? null;
+    if (!pal) pal = palByName.get(rawTex.texname) ?? null;
+    if (!pal && rawPalettes.length > 0 && rawTex.format !== 7) pal = rawPalettes[0];
+
+    const key = `${rawTex.texname}|${pal?.palname ?? ""}`;
+    if (decodedKeys.has(key)) continue;
+    decodedKeys.add(key);
+
+    const rgba = makeTexture(rawTex, pal);
+    if (rgba) {
+      decoded.push({ name: rawTex.texname, width: rawTex.width, height: rawTex.height, format: rawTex.format, rgba, materialKey: key });
+    }
+  }
+
+  console.log(`[MatchTex] Decoded ${decoded.length} unique texture+palette combinations`);
+  return decoded;
 }
 
 // ─── NSBMD Mesh Builder ──────────────────────────────────────
@@ -335,43 +521,66 @@ function buildNSBMDMesh(
   scene: THREE.Scene,
   flat: FlatMeshData,
   wireframe: boolean,
-  texData: TEX0Data | null
+  decodedTextures: DecodedMaterialTexture[]
 ): { min: THREE.Vector3; max: THREE.Vector3 } | null {
-  // Normalize UVs from texel space to 0-1 based on texture dimensions
-  const normalizedUvs = new Float32Array(flat.uvs.length);
-  normalizedUvs.set(flat.uvs);
+  // Build texture lookup maps:
+  // 1. By materialKey ("texName|palName") — exact per-material match
+  // 2. By texture name — fallback for mesh groups without specific palette
+  const texByKey = new Map<string, DecodedMaterialTexture>();
+  const texByName = new Map<string, DecodedMaterialTexture>();
+  for (const tex of decodedTextures) {
+    texByKey.set(tex.materialKey, tex);
+    if (!texByName.has(tex.name)) texByName.set(tex.name, tex);
+  }
 
-  // Helper: find texture by name with fallback prefix matching
-  const findTexIdx = (name: string): number | undefined => {
-    if (!texData) return undefined;
-    // Exact match first
-    const exact = texData.textureMap.get(name);
-    if (exact !== undefined) return exact;
-    // Try prefix match (e.g., "tree04_2" could match "tree04")
-    for (const [tname, idx] of texData.textureMap) {
-      if (name.startsWith(tname) || tname.startsWith(name)) return idx;
+  // Helper: find texture for a mesh group using materialKey first, then name fallback
+  const findTexForMesh = (mt: { textureName: string; paletteName: string }): DecodedMaterialTexture | undefined => {
+    // Try exact materialKey match first
+    const key = `${mt.textureName}|${mt.paletteName}`;
+    const byKey = texByKey.get(key);
+    if (byKey) return byKey;
+
+    // Try texture name only (any palette)
+    const byName = texByName.get(mt.textureName);
+    if (byName) return byName;
+
+    // Prefix matching fallback
+    for (const [, tex] of texByName) {
+      if (mt.textureName.startsWith(tex.name) || tex.name.startsWith(mt.textureName)) return tex;
     }
     return undefined;
   };
 
-  if (texData) {
+  // Normalize UVs from texel space to 0-1 based on texture dimensions
+  // DSPRE formula: uv = (scaleS / width) * rawUV / (flipS + 1)
+  const normalizedUvs = new Float32Array(flat.uvs.length);
+  normalizedUvs.set(flat.uvs);
+
+  if (decodedTextures.length > 0) {
+    const normalized = new Uint8Array(flat.uvs.length / 2);
+
     for (const mt of flat.meshTextures) {
-      const texIdx = findTexIdx(mt.textureName);
-      if (texIdx !== undefined) {
-        const tex = texData.textures[texIdx];
-        // Convert texel coords to normalized UVs
-        // UV data is interleaved: [s0, t0, s1, t1, ...]
-        // We need to find which vertices belong to this mesh's index range
-        // Since indices reference into the shared vertex array, we need
-        // to find the vertex range for this mesh segment
-        const vertStart = mt.indexStart > 0
-          ? Math.min(...Array.from(flat.indices.slice(mt.indexStart, mt.indexStart + mt.indexCount)))
-          : 0;
-        const vertEnd = Math.max(...Array.from(flat.indices.slice(mt.indexStart, mt.indexStart + mt.indexCount))) + 1;
-        for (let v = vertStart; v < vertEnd && v * 2 + 1 < normalizedUvs.length; v++) {
-          normalizedUvs[v * 2] /= tex.width;
-          normalizedUvs[v * 2 + 1] /= tex.height;
-        }
+      const tex = findTexForMesh(mt);
+      if (!tex) continue;
+
+      const uv = mt.uvProps;
+      // DSPRE: (scaleS / width) * rawUV / (flipS + 1)
+      const scaleU = (uv.scaleS / tex.width) / (uv.flipS + 1);
+      const scaleV = (uv.scaleT / tex.height) / (uv.flipT + 1);
+
+      const idxSlice = flat.indices.subarray(mt.indexStart, mt.indexStart + mt.indexCount);
+      let vertMin = Infinity, vertMax = -Infinity;
+      for (let k = 0; k < idxSlice.length; k++) {
+        const vi = idxSlice[k];
+        if (vi < vertMin) vertMin = vi;
+        if (vi > vertMax) vertMax = vi;
+      }
+
+      for (let v = vertMin; v <= vertMax && v * 2 + 1 < normalizedUvs.length; v++) {
+        if (normalized[v]) continue;
+        normalizedUvs[v * 2] *= scaleU;
+        normalizedUvs[v * 2 + 1] *= scaleV;
+        normalized[v] = 1;
       }
     }
   }
@@ -385,26 +594,53 @@ function buildNSBMDMesh(
   geometry.computeVertexNormals();
   geometry.computeBoundingBox();
 
-  // Build Three.js textures from TEX0 data
+  // Build Three.js textures per mesh group with correct wrap modes per material
+  // DSPRE: repeatS+flipS → GL_MIRRORED_REPEAT, repeatS only → GL_REPEAT, else → GL_CLAMP
+  const getWrapMode = (repeat: number, flip: number): THREE.Wrapping => {
+    if (repeat && flip) return THREE.MirroredRepeatWrapping;
+    if (repeat) return THREE.RepeatWrapping;
+    return THREE.ClampToEdgeWrapping;
+  };
+
+  // Cache decoded RGBA data by materialKey to reuse
+  const decodedByKey = new Map<string, DecodedMaterialTexture>();
+  const decodedByName = new Map<string, DecodedMaterialTexture>();
+  for (const tex of decodedTextures) {
+    decodedByKey.set(tex.materialKey, tex);
+    if (!decodedByName.has(tex.name)) decodedByName.set(tex.name, tex);
+  }
+
+  // Create Three.js textures per mesh group (unique key = materialKey + wrap mode)
   const threeTextures = new Map<string, THREE.Texture>();
-  if (texData) {
-    for (const tex of texData.textures) {
-      // Copy to a fresh ArrayBuffer to satisfy TypeScript's strict typing
-      const rgbaCopy = new Uint8Array(tex.rgba.length);
-      rgbaCopy.set(tex.rgba);
-      const dataTex = new THREE.DataTexture(
-        rgbaCopy, tex.width, tex.height, THREE.RGBAFormat
-      );
-      dataTex.needsUpdate = true;
-      dataTex.magFilter = THREE.NearestFilter;
-      dataTex.minFilter = THREE.NearestFilter;
-      dataTex.wrapS = THREE.RepeatWrapping;
-      dataTex.wrapT = THREE.RepeatWrapping;
-      // DataTexture default is flipY=false which matches NDS top-to-bottom storage
-      dataTex.flipY = false;
-      threeTextures.set(tex.name, dataTex);
-    }
-    console.log(`[3D] Created ${threeTextures.size} Three.js textures`);
+  for (const mt of flat.meshTextures) {
+    const tex = findTexForMesh(mt);
+    if (!tex) continue;
+
+    const uv = mt.uvProps;
+    const wrapS = getWrapMode(uv.repeatS, uv.flipS);
+    const wrapT = getWrapMode(uv.repeatT, uv.flipT);
+    const fullKey = `${tex.materialKey}|${wrapS}|${wrapT}`;
+
+    if (threeTextures.has(fullKey)) continue;
+
+    const rgbaCopy = new Uint8Array(tex.rgba.length);
+    rgbaCopy.set(tex.rgba);
+    const dataTex = new THREE.DataTexture(
+      rgbaCopy, tex.width, tex.height, THREE.RGBAFormat
+    );
+    dataTex.needsUpdate = true;
+    dataTex.magFilter = THREE.NearestFilter;
+    dataTex.minFilter = THREE.NearestFilter;
+    dataTex.wrapS = wrapS;
+    dataTex.wrapT = wrapT;
+    dataTex.flipY = false;
+    threeTextures.set(fullKey, dataTex);
+    // Also store by materialKey and name for fallback
+    if (!threeTextures.has(tex.materialKey)) threeTextures.set(tex.materialKey, dataTex);
+    if (!threeTextures.has(tex.name)) threeTextures.set(tex.name, dataTex);
+  }
+  if (threeTextures.size > 0) {
+    console.log(`[3D] Created ${threeTextures.size} Three.js textures (${decodedTextures.length} unique material+palette combos)`);
   }
 
   // Create materials per mesh group
@@ -412,44 +648,34 @@ function buildNSBMDMesh(
   let groupIndex = 0;
 
   if (!wireframe && flat.meshTextures.length > 0 && threeTextures.size > 0) {
-    // Group geometry by texture for multi-material rendering
     for (const mt of flat.meshTextures) {
-      // Look up texture by exact name, then try prefix match
-      let tex = threeTextures.get(mt.textureName);
-      if (!tex) {
-        for (const [tname, t] of threeTextures) {
-          if (mt.textureName.startsWith(tname) || tname.startsWith(mt.textureName)) {
-            tex = t;
-            break;
-          }
-        }
+      const decodedTex = findTexForMesh(mt);
+      const uv = mt.uvProps;
+      const wrapS = getWrapMode(uv.repeatS, uv.flipS);
+      const wrapT = getWrapMode(uv.repeatT, uv.flipT);
+
+      // Try full key with wrap modes, then materialKey, then name
+      let tex: THREE.Texture | undefined;
+      if (decodedTex) {
+        const fullKey = `${decodedTex.materialKey}|${wrapS}|${wrapT}`;
+        tex = threeTextures.get(fullKey);
+        if (!tex) tex = threeTextures.get(decodedTex.materialKey);
       }
+      if (!tex) tex = threeTextures.get(mt.textureName);
       if (tex) {
         materials.push(new THREE.MeshBasicMaterial({
-          map: tex,
-          vertexColors: true,
-          side: THREE.DoubleSide,
-          transparent: true,
-          alphaTest: 0.1,
+          map: tex, vertexColors: true, side: THREE.DoubleSide,
+          transparent: true, alphaTest: 0.1,
         }));
       } else {
         materials.push(new THREE.MeshBasicMaterial({
-          vertexColors: true,
-          side: THREE.DoubleSide,
+          vertexColors: true, side: THREE.DoubleSide,
         }));
       }
       geometry.addGroup(mt.indexStart, mt.indexCount, groupIndex++);
     }
     const matched = materials.filter(m => (m as THREE.MeshBasicMaterial).map).length;
-    const unmatched = flat.meshTextures.filter(mt => {
-      let found = threeTextures.has(mt.textureName);
-      if (!found) {
-        for (const tname of threeTextures.keys()) {
-          if (mt.textureName.startsWith(tname) || tname.startsWith(mt.textureName)) { found = true; break; }
-        }
-      }
-      return !found;
-    }).map(mt => mt.textureName);
+    const unmatched = flat.meshTextures.filter(mt => !findTexForMesh(mt)).map(mt => `"${mt.textureName}|${mt.paletteName}"`);
     console.log(`[3D] Texture matching: ${matched}/${flat.meshTextures.length} matched, unmatched: ${unmatched.join(", ") || "none"}`);
   }
 
